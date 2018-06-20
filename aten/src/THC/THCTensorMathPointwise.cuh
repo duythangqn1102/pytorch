@@ -37,7 +37,7 @@ struct TensorSigmoidOp<half> {
   __device__ __forceinline__ void operator()(half* out, half* in) const {
 #ifdef CUDA_HALF_INSTRUCTIONS
     half one = ScalarConvert<int, half>::to(1);
-    *out = hdiv(one, __hadd(one, hexp(__hneg(*in))));
+    *out = __hdiv(one, __hadd(one, hexp(__hneg(*in))));
 #else
     float fin = __half2float(*in);
     *out = __float2half(1.0f / (1.0f + expf(- fin)));
@@ -47,7 +47,7 @@ struct TensorSigmoidOp<half> {
   __device__ __forceinline__ void operator()(half* v) const {
 #ifdef CUDA_HALF_INSTRUCTIONS
     half one = ScalarConvert<int, half>::to(1);
-    *v = hdiv(one, __hadd(one, hexp(__hneg(*v))));
+    *v = __hdiv(one, __hadd(one, hexp(__hneg(*v))));
 #else
     float fv = __half2float(*v);
     *v = __float2half(1.0f / (1.0f + expf(- fv)));
@@ -440,11 +440,25 @@ struct TensorDivOp<half> {
 };
 #endif // CUDA_HALF_TENSOR
 
+template<typename T>
+static __device__ __forceinline__
+typename std::enable_if<std::is_signed<T>::value, bool>::type
+modulo_wrap(T a, T b) {
+  return (a != 0) && (a < 0) != (b < 0);
+}
+
+template<typename T>
+static __device__ __forceinline__
+typename std::enable_if<std::is_unsigned<T>::value, bool>::type
+modulo_wrap(T a, T b) {
+  return false;
+}
+
 template <typename T>
 struct TensorCRemainderOp {
   __device__ __forceinline__ void operator()(T* out, T* in) {
     T val =  *out % *in;
-    if ((val * *in)<0){
+    if (modulo_wrap(val, *in)) {
       val += *in;
     }
     *out = val;
@@ -452,7 +466,7 @@ struct TensorCRemainderOp {
 
   __device__ __forceinline__ void operator()(T* out, T* in1, T* in2) {
     T val = *in1 % *in2;
-    if ((val * *in2)<0){
+    if (modulo_wrap(val, *in2)) {
       val += *in2;
     }
     *out = val;
@@ -462,22 +476,22 @@ struct TensorCRemainderOp {
 template <>
 struct TensorCRemainderOp<float> {
   __device__ __forceinline__ void operator()(float* out, float* in) {
-    *out = *in != 0 ? *out - *in * floorf(*out / *in) : NAN;
+    *out = *in != 0.f ? *out - *in * floorf(*out / *in) : NAN;
   }
 
   __device__ __forceinline__ void operator()(float* out, float* in1, float* in2) {
-    *out = *in2 != 0 ? *in1 - *in2 * floorf(*in1 / *in2) : NAN;
+    *out = *in2 != 0.f ? *in1 - *in2 * floorf(*in1 / *in2) : NAN;
   }
 };
 
 template <>
 struct TensorCRemainderOp<double> {
   __device__ __forceinline__ void operator()(double* out, double* in) {
-    *out = *in != 0 ? *out - *in * floor(*out / *in) : NAN;
+    *out = *in != 0. ? *out - *in * floor(*out / *in) : NAN;
   }
 
   __device__ __forceinline__ void operator()(double* out, double* in1, double* in2) {
-    *out = *in2 != 0 ? *in1 - *in2 * floor(*in1 / *in2) : NAN;
+    *out = *in2 != 0. ? *in1 - *in2 * floor(*in1 / *in2) : NAN;
   }
 };
 
@@ -641,11 +655,11 @@ struct TensorMaxValueOp {
   TensorMaxValueOp(T v) : val(v) {}
 
   __device__ __forceinline__ void operator()(T* out) {
-    *out = THCNumerics<T>::gt(*out, val) ? *out : val;
+    *out = THCNumerics<T>::lt(*out, val) ? val : *out;  // this order propagates NaN
   }
 
   __device__ __forceinline__ void operator()(T* out, T* in) {
-    *out = THCNumerics<T>::gt(*in, val) ? *in : val;
+    *out = THCNumerics<T>::lt(*in, val) ? val : *in;  // this order propagates NaN
   }
 
   T val;
@@ -656,11 +670,11 @@ struct TensorMinValueOp {
   TensorMinValueOp(T v) : val(v) {}
 
   __device__ __forceinline__ void operator()(T* out) {
-    *out = THCNumerics<T>::lt(*out, val) ? *out : val;
+    *out = THCNumerics<T>::gt(*out, val) ? val : *out;  // this order propagates NaN
   }
 
   __device__ __forceinline__ void operator()(T* out, T* in) {
-    *out = THCNumerics<T>::lt(*in, val) ? *in : val;
+    *out = THCNumerics<T>::gt(*in, val) ? val : *in;  // this order propagates NaN
   }
 
   T val;

@@ -2,9 +2,14 @@
 #include "caffe2/utils/cpu_neon.h"
 #include "caffe2/utils/math.h"
 
+#ifdef CAFFE2_USE_IDEEP
+#include <caffe2/ideep/operators/operator_fallback_ideep.h>
+#include <caffe2/ideep/utils/ideep_operator.h>
+#endif
+
 namespace caffe2 {
 
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
 namespace {
 
 //
@@ -49,7 +54,7 @@ inline uint8x8_t convertNarrowAndPack(float32x4_t v0, float32x4_t v1) {
 }
 
 } // unnamed namespace
-#endif // __ARM_NEON__
+#endif // defined(__ARM_NEON__) || defined(__ARM_NEON)
 
 class PackedInt8BGRANHWCToNCHWCStylizerPreprocessOp
     : public Operator<CPUContext> {
@@ -82,7 +87,7 @@ class PackedInt8BGRANHWCToNCHWCStylizerPreprocessOp
       // Cache it to maintain temporal consistency.
       auto* t = noiseBlob->template GetMutable<TensorCPU>();
 
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
       // Noise space is larger for vectorized code due to the
       // vectorized load
       initNoiseCPUNeon(t, defaultNoiseSize);
@@ -115,7 +120,7 @@ class PackedInt8BGRANHWCToNCHWCStylizerPreprocessOp
     return true;
   }
 
-#ifndef __ARM_NEON__
+#if !defined(__ARM_NEON__) && !defined(__ARM_NEON)
   void initNoiseCPU(Tensor<CPUContext>* noise, int size) {
     noise->Resize(size);
 
@@ -126,9 +131,9 @@ class PackedInt8BGRANHWCToNCHWCStylizerPreprocessOp
         noise->template mutable_data<float>(),
         &context_);
   }
-#endif // !__ARM_NEON__
+#endif // !defined(__ARM_NEON__) && !defined(__ARM_NEON)
 
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
   void initNoiseCPUNeon(Tensor<CPUContext>* noise, int size) {
     // For ARM NEON, we read in multiples of kNeonNoiseReadSize since
     // the inner loop is vectorized. Round up to the next highest
@@ -143,7 +148,7 @@ class PackedInt8BGRANHWCToNCHWCStylizerPreprocessOp
         noise->template mutable_data<float>(),
         &context_);
   }
-#endif // __ARM_NEON
+#endif // defined(__ARM_NEON__) || defined(__ARM_NEON)
 
   void runBatch(
       int N,
@@ -161,15 +166,15 @@ class PackedInt8BGRANHWCToNCHWCStylizerPreprocessOp
       auto curInput = input + n * kInputChannels * planeSize;
       auto curOutput = output + n * kOutputChannels * planeSize;
 
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
       runCPUNeon(H, W, noiseCycle, curInput, meanChannel, noise, curOutput);
 #else
       runCPU(H, W, noiseCycle, curInput, meanChannel, noise, curOutput);
-#endif // __ARM_NEON__
+#endif // defined(__ARM_NEON__) || defined(__ARM_NEON)
     }
   }
 
-#ifndef __ARM_NEON__
+#if !defined(__ARM_NEON__) && !defined(__ARM_NEON)
   void runCPU(
       int H,
       int W,
@@ -192,9 +197,9 @@ class PackedInt8BGRANHWCToNCHWCStylizerPreprocessOp
       }
     }
   }
-#endif // !__ARM_NEON__
+#endif // !defined(__ARM_NEON__) && !defined(__ARM_NEON)
 
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
   void runCPUNeon(
       int H,
       int W,
@@ -373,7 +378,7 @@ class PackedInt8BGRANHWCToNCHWCStylizerPreprocessOp
       }
     }
   }
-#endif // __ARM_NEON__
+#endif //  defined(__ARM_NEON__) || defined(__ARM_NEON)
 
  private:
   Workspace* ws_;
@@ -443,15 +448,15 @@ class BRGNCHWCToPackedInt8BGRAStylizerDeprocessOp
       auto curInput = input + n * kInputChannels * planeSize;
       auto curOutput = output + n * kOutputChannels * planeSize;
 
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
       runCPUNeon(H, W, curInput, meanChannel, curOutput);
 #else
       runCPU(H, W, curInput, meanChannel, curOutput);
-#endif // __ARM_NEON__
+#endif //  defined(__ARM_NEON__) || defined(__ARM_NEON)
     }
   }
 
-#ifndef __ARM_NEON__
+#if !defined(__ARM_NEON__) && !defined(__ARM_NEON)
   void runCPU(
       int H,
       int W,
@@ -472,9 +477,9 @@ class BRGNCHWCToPackedInt8BGRAStylizerDeprocessOp
           std::numeric_limits<uint8_t>::max();
     }
   }
-#endif // !__ARM_NEON__
+#endif // !defined(__ARM_NEON__) && !defined(__ARM_NEON)
 
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
   void runCPUNeon(
       int H,
       int W,
@@ -563,7 +568,7 @@ class BRGNCHWCToPackedInt8BGRAStylizerDeprocessOp
           std::numeric_limits<uint8_t>::max();
     }
   }
-#endif // __ARM_NEON__
+#endif // defined(__ARM_NEON__) || defined(__ARM_NEON)
 };
 
 namespace {
@@ -580,5 +585,14 @@ REGISTER_CPU_OPERATOR(
 OPERATOR_SCHEMA(BRGNCHWCToPackedInt8BGRAStylizerDeprocess)
     .NumInputs(2)
     .NumOutputs(1);
+
+#ifdef CAFFE2_USE_IDEEP
+REGISTER_IDEEP_OPERATOR(
+    BRGNCHWCToPackedInt8BGRAStylizerDeprocess,
+    IDEEPFallbackOp<BRGNCHWCToPackedInt8BGRAStylizerDeprocessOp, SkipIndices<0>>);
+REGISTER_IDEEP_OPERATOR(
+    PackedInt8BGRANHWCToNCHWCStylizerPreprocess,
+    IDEEPFallbackOp<PackedInt8BGRANHWCToNCHWCStylizerPreprocessOp>);
+#endif
 } // namespace
 } // namespace caffe2

@@ -134,19 +134,6 @@ TH_API void THNN_(GatedLinear_updateGradInput)(
           THTensor *gradInput,         // [OUT] gradient w.r.t input
           int dim);                    // dimension for halving operation
 
-// HardShink outputs 0 on interval of (-lambda; lambda) or original value otherwise.
-TH_API void THNN_(HardShrink_updateOutput)(
-          THNNState *state,            // library's state
-          THTensor *input,             // input tensor
-          THTensor *output,            // [OUT] output tensor
-          accreal lambda);             // HardShrink parameter
-TH_API void THNN_(HardShrink_updateGradInput)(
-          THNNState *state,            // library's state
-          THTensor *input,             // input tensor
-          THTensor *gradOutput,        // gradient w.r.t. module's output
-          THTensor *gradInput,         // [OUT] gradient w.r.t. input
-          accreal lambda);             // HardShrink parameter
-
 // HardTanh clamps the values to the interval [min_val; max_val].
 TH_API void THNN_(HardTanh_updateOutput)(
           THNNState *state,            // library's state
@@ -273,19 +260,6 @@ TH_API void THNN_(LogSigmoid_updateGradInput)(
           THTensor *gradOutput,        // gradient w.r.t. module's output
           THTensor *gradInput,         // [OUT] gradient w.r.t. input
           THTensor *buffer);           // [BUFFER]
-
-TH_API void THNN_(LogSoftMax_updateOutput)(
-          THNNState *state,            // library's state
-          THTensor *input,             // input tensor
-          THTensor *output,            // [OUT] output tensor
-          int64_t dim);
-TH_API void THNN_(LogSoftMax_updateGradInput)(
-          THNNState *state,            // library's state
-          THTensor *input,             // input tensor
-          THTensor *gradOutput,        // gradient w.r.t. module's output
-          THTensor *gradInput,         // [OUT] gradient w.r.t. input
-          THTensor *output,            // module's output
-          int64_t dim);
 
 TH_API void THNN_(LookupTable_accGradParameters)(
           THNNState *state,
@@ -486,19 +460,6 @@ TH_API void THNN_(SmoothL1Criterion_updateGradInput)(
           THTensor *gradInput,
           bool sizeAverage,
           bool reduce);
-
-TH_API void THNN_(SoftMax_updateOutput)(
-          THNNState *state,
-          THTensor *input,
-          THTensor *output,
-          int64_t dim);
-TH_API void THNN_(SoftMax_updateGradInput)(
-          THNNState *state,
-          THTensor *input,
-          THTensor *gradOutput,
-          THTensor *gradInput,
-          THTensor *output,
-          int64_t dim);
 
 TH_API void THNN_(SoftPlus_updateOutput)(
           THNNState *state,

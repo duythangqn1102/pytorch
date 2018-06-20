@@ -80,6 +80,18 @@ Convolution layers
 .. autoclass:: ConvTranspose3d
     :members:
 
+:hidden:`Fold`
+~~~~~~~~~~~~~~
+
+.. autoclass:: Fold
+    :members:
+
+:hidden:`Unfold`
+~~~~~~~~~~~~~~~
+
+.. autoclass:: Unfold
+    :members:
+
 
 Pooling layers
 ----------------------------------
@@ -383,6 +395,12 @@ Non-linear activations (other)
 .. autoclass:: LogSoftmax
     :members:
 
+:hidden:`AdaptiveLogSoftmaxWithLoss`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: AdaptiveLogSoftmaxWithLoss
+    :members:
+
 Normalization layers
 ----------------------------------
 
@@ -404,7 +422,13 @@ Normalization layers
 .. autoclass:: BatchNorm3d
     :members:
 
-:hidden:`InstanceNorm1d`
+:hidden:`GroupNorm`
+~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: GroupNorm
+    :members:
+
+    :hidden:`InstanceNorm1d`
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. autoclass:: InstanceNorm1d
@@ -701,14 +725,24 @@ Utilities
 ---------
 
 :hidden:`clip_grad_norm_`
-~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. autofunction:: torch.nn.utils.clip_grad_norm_
 
 :hidden:`clip_grad_value_`
-~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. autofunction:: torch.nn.utils.clip_grad_value_
+
+:hidden:`parameters_to_vector`
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: torch.nn.utils.parameters_to_vector
+
+:hidden:`vector_to_parameters`
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: torch.nn.utils.vector_to_parameters
 
 :hidden:`weight_norm`
 ~~~~~~~~~~~~~~~~~~~~~
@@ -719,6 +753,16 @@ Utilities
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. autofunction:: torch.nn.utils.remove_weight_norm
+
+:hidden:`spectral_norm`
+~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: torch.nn.utils.spectral_norm
+
+:hidden:`remove_spectral_norm`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: torch.nn.utils.remove_spectral_norm
 
 
 .. currentmodule:: torch.nn.utils.rnn
@@ -790,6 +834,16 @@ Convolution functions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. autofunction:: conv_transpose3d
+
+:hidden:`fold`
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: fold
+
+:hidden:`unfold`
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: unfold
 
 Pooling functions
 ----------------------------------
@@ -980,6 +1034,11 @@ Non-linear activation functions
 
 .. autofunction:: softshrink
 
+:hidden:`gumbel_softmax`
+~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: gumbel_softmax
+
 :hidden:`log_softmax`
 ~~~~~~~~~~~~~~~~~~~~~
 
@@ -1053,6 +1112,19 @@ Dropout functions
 ~~~~~~~~~~~~~~~~~~~
 
 .. autofunction:: dropout3d
+
+Sparse functions
+----------------------------------
+
+:hidden:`embedding`
+~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: embedding
+
+:hidden:`embedding_bag`
+~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: embedding_bag
 
 Distance functions
 ----------------------------------
@@ -1195,10 +1267,10 @@ Vision functions
 .. autofunction:: affine_grid
 
 DataParallel functions (multi-GPU, distributed)
---------------------------------------------
+-----------------------------------------------
 
 :hidden:`data_parallel`
-~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
 
 .. autofunction:: torch.nn.parallel.data_parallel
 

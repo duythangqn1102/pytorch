@@ -2,27 +2,11 @@
 #define THS_GENERIC_FILE "generic/THSTensor.h"
 #else
 
-typedef struct THSTensor
-{  // Stored in COO format, indices + values
-    int64_t *size;
-    ptrdiff_t nnz;
-    int nDimensionI; // dimension of indices
-    int nDimensionV; // dimension of values
-
-    // 2-D tensor of nDim x nnz of indices. May have nnz dim bigger than nnz
-    // as buffer, so we keep track of both
-    THLongTensor *indices;
-    THTensor *values;
-    // A sparse tensor is 'coalesced' if every index occurs at most once in
-    // the indices tensor, and the indices are in sorted order.
-    // Most math operations can only be performed on ordered sparse tensors
-    int coalesced;
-    int refcount;
-
-} THSTensor;
+// Moved to THSTensor.hpp
+typedef struct THSTensor THSTensor;
 
 /**** access methods ****/
-TH_API int THSTensor_(nDimension)(const THSTensor *self);
+TH_API int THSTensor_(_nDimension)(const THSTensor *self);
 TH_API int THSTensor_(nDimensionI)(const THSTensor *self);
 TH_API int THSTensor_(nDimensionV)(const THSTensor *self);
 TH_API int64_t THSTensor_(size)(const THSTensor *self, int dim);
@@ -48,7 +32,6 @@ TH_API THSTensor *THSTensor_(newClone)(THSTensor *self);
 TH_API THSTensor *THSTensor_(newTranspose)(THSTensor *self, int dimension1_, int dimension2_);
 
 /**** reshaping methods ***/
-TH_API THSTensor *THSTensor_(resize)(THSTensor *self, THLongStorage *size);
 TH_API THSTensor *THSTensor_(resizeAs)(THSTensor *self, THSTensor *src);
 TH_API THSTensor *THSTensor_(resize1d)(THSTensor *self, int64_t size0);
 TH_API THSTensor *THSTensor_(resize2d)(THSTensor *self, int64_t size0, int64_t size1);

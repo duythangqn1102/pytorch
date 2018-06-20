@@ -5,24 +5,28 @@
 #include "caffe2/operators/cross_entropy_op.h"
 #include "caffe2/operators/dropout_op.h"
 #include "caffe2/operators/elementwise_linear_op.h"
-#include "caffe2/operators/elementwise_op.h"
+#include "caffe2/operators/elementwise_ops.h"
 #include "caffe2/operators/filler_op.h"
 #include "caffe2/operators/load_save_op.h"
 #include "caffe2/operators/loss_op.h"
+#include "caffe2/operators/order_switch_ops.h"
 #include "caffe2/operators/reshape_op.h"
 #include "caffe2/operators/softmax_op.h"
 #include "caffe2/operators/utility_ops.h"
 
 namespace caffe2 {
 namespace {
+
 struct SigmoidCPUFunctor {
   template <typename T>
-  inline void
-  operator()(const int n, const T* x, T* y, CPUContext* /*device_context*/) {
+  bool operator()(const int n, const T* x, T* y, CPUContext* /* context */)
+      const {
     ConstEigenVectorArrayMap<T> xM(x, n);
     EigenVectorArrayMap<T>(y, n) = 1. / (1. + (-xM).exp());
+    return true;
   }
 };
+
 } // namespace
 } // namespace caffe2
 
@@ -70,5 +74,11 @@ REGISTER_MKL_OPERATOR(
 REGISTER_MKL_OPERATOR(
     ChannelShuffle,
     mkl::MKLFallbackOp<ChannelShuffleOp<CPUContext>>);
+REGISTER_MKL_OPERATOR(
+    NCHW2NHWC,
+    mkl::MKLFallbackOp<NCHW2NHWCOp<float, CPUContext>>);
+REGISTER_MKL_OPERATOR(
+    NHWC2NCHW,
+    mkl::MKLFallbackOp<NHWC2NCHWOp<float, CPUContext>>);
 
 } // namespace caffe2

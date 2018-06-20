@@ -2,8 +2,12 @@ import os
 import itertools
 import importlib
 
-THNN_H_PATH = os.path.join(os.path.dirname(__file__), '..', 'lib', 'THNN.h')
-THCUNN_H_PATH = os.path.join(os.path.dirname(__file__), '..', 'lib', 'THCUNN.h')
+# in fbcode, this fails in some cases, but we don't need it, therefore the try-catch
+try:
+    THNN_H_PATH = os.path.join(os.path.dirname(__file__), '..', 'lib', 'THNN.h')
+    THCUNN_H_PATH = os.path.join(os.path.dirname(__file__), '..', 'lib', 'THCUNN.h')
+except Exception:
+    pass
 
 
 def _unpickle_backend(backend_name):
@@ -87,6 +91,13 @@ def parse_header(path):
     for l, c in lines:
         if l.startswith('TH_API void THNN_'):
             fn_name = l.lstrip('TH_API void THNN_')
+            if fn_name[0] == '(' and fn_name[-2] == ')':
+                fn_name = fn_name[1:-2]
+            else:
+                fn_name = fn_name[:-1]
+            generic_functions.append(Function(fn_name))
+        elif l.startswith('THC_API void THNN_'):
+            fn_name = l.lstrip('THC_API void THNN_')
             if fn_name[0] == '(' and fn_name[-2] == ')':
                 fn_name = fn_name[1:-2]
             else:

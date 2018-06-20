@@ -50,7 +50,12 @@ Tensor isclose(const Tensor& self, const Tensor& other, double rtol, double atol
 }
 
 bool is_nonzero(const Tensor& self) {
-  if (self.numel() != 1) {
+  auto n = self.numel();
+  AT_ASSERT(n >= 0);
+  if (n == 0) {
+    AT_ERROR("bool value of Tensor with no values is ambiguous");
+  }
+  if (n > 1) {
     AT_ERROR("bool value of Tensor with more than one value is ambiguous");
   }
   Scalar localScalar = self.pImpl->localScalar();
@@ -64,7 +69,7 @@ bool is_nonzero(const Tensor& self) {
 
 Tensor where(const Tensor& condition, const Tensor& self, const Tensor& other) {
   if (condition.type().scalarType() != ScalarType::Byte) {
-    AT_ERROR("Expected condition to have ScalarType Byte, but got ScalarType %s",
+    AT_ERROR("Expected condition to have ScalarType Byte, but got ScalarType ",
                   toString(condition.type().scalarType()));
   }
   Tensor b_condition, b_self, b_other;

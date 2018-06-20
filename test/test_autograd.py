@@ -8,14 +8,14 @@ import warnings
 from copy import deepcopy
 from collections import OrderedDict
 from itertools import product
-from operator import mul
+from operator import mul, itemgetter
 from functools import reduce, wraps
 from torch.autograd.gradcheck import gradgradcheck, gradcheck
 from torch.autograd.function import once_differentiable
 from torch.autograd.profiler import profile
 from common import TEST_MKL, TestCase, run_tests, skipIfNoLapack, \
-    suppress_warnings
-from torch.autograd import Variable, Function
+    suppress_warnings, skipIfNoZeroSize
+from torch.autograd import Variable, Function, detect_anomaly
 from torch.autograd.function import InplaceFunction
 from torch.testing import make_non_contiguous, randn_like
 
@@ -75,7 +75,7 @@ class TestAutograd(TestCase):
         x = torch.randn(5, 5, requires_grad=True)
         y = torch.randn(5, 5, requires_grad=True)
         result = cls.apply(x, 2, y)
-        go = torch.ones(1, requires_grad=True)
+        go = torch.ones((), requires_grad=True)
         result.sum().backward(go, create_graph=True)
 
         self.assertEqual(x.grad.data, y.data + torch.ones(5, 5))
@@ -108,14 +108,8 @@ class TestAutograd(TestCase):
 
         x_grad_desc = graph_desc(x.grad.grad_fn)
         y_grad_desc = graph_desc(y.grad.grad_fn)
-        self.assertEqual(
-            x_grad_desc,
-            'CloneBackward(AddBackward1(ExpandBackward(AccumulateGrad()), '
-            'MulBackward1(ExpandBackward(AccumulateGrad()), AccumulateGrad())))')
-        self.assertEqual(
-            y_grad_desc,
-            'CloneBackward(AddBackward1(MulBackward0(ExpandBackward(AccumulateGrad())), '
-            'MulBackward1(ExpandBackward(AccumulateGrad()), AccumulateGrad())))')
+        self.assertExpected(x_grad_desc, "x_grad_desc")
+        self.assertExpected(y_grad_desc, "y_grad_desc")
 
     def test_once_differentiable(self):
         class MyFunction(Function):
@@ -150,13 +144,14 @@ class TestAutograd(TestCase):
             def backward(ctx, grad):
                 return grad * 2
 
-        v = torch.ones(1, requires_grad=True)
-        MyFunction.apply(v).backward()
-        self.assertEqual(v.grad.data.tolist(), [2])
+        for shape in [(1,), ()]:
+            v = torch.ones(shape, requires_grad=True)
+            MyFunction.apply(v).backward()
+            self.assertEqual(v.grad, torch.full(shape, 2))
 
-        v.grad.data.zero_()
-        MyFunction.apply(v.clone()).backward()
-        self.assertEqual(v.grad.data.tolist(), [2])
+            v.grad.data.zero_()
+            MyFunction.apply(v.clone()).backward()
+            self.assertEqual(v.grad, torch.full(shape, 2))
 
     def test_legacy_function_none_grad(self):
         class MyFunction(Function):
@@ -171,6 +166,23 @@ class TestAutograd(TestCase):
         y = v[0, 0].expand(3, 5).t().sum()
         MyFunction()(y).sum().backward()
         self.assertEqual(v.grad.data, torch.zeros(shape))
+
+    def test_invalid_gradients(self):
+        class MyFunction(Function):
+            @staticmethod
+            def forward(ctx, x):
+                return x * 2
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                return torch.randn(10, dtype=torch.float)
+
+        with self.assertRaisesRegex(RuntimeError, 'expected shape'):
+            input = torch.randn(5, 5, dtype=torch.float, requires_grad=True)
+            MyFunction.apply(input).sum().backward()
+        with self.assertRaisesRegex(RuntimeError, 'expected type'):
+            input = torch.randn(10, dtype=torch.double, requires_grad=True)
+            MyFunction.apply(input).sum().backward()
 
     def test_accumulate_grad(self):
         grad_output = torch.ones(5, 5)
@@ -494,7 +506,6 @@ class TestAutograd(TestCase):
 
     def test_sparse_backward(self):
         class FixedGradientFunction(Function):
-
             def __init__(self, grad):
                 self.grad = grad
 
@@ -523,15 +534,15 @@ class TestAutograd(TestCase):
         dense_fn = FixedGradientFunction(dense_grad)
 
         # sparse first
-        x = torch.randn(5, 5, requires_grad=True)
+        x = torch.randn(size, requires_grad=True)
         (sparse_fn1(x) + dense_fn(x) + sparse_fn2(x)).sum().backward()
         self.assertEqual(x.grad, dense_grad + sparse_grad1 + sparse_grad2)
         # dense first
-        x = torch.randn(5, 5, requires_grad=True)
+        x = torch.randn(size, requires_grad=True)
         (dense_fn(x) + sparse_fn1(x) + sparse_fn2(x)).sum().backward()
         self.assertEqual(x.grad, dense_grad + sparse_grad1 + sparse_grad2)
         # sparse only
-        x = torch.randn(5, 5, requires_grad=True)
+        x = torch.randn(size, requires_grad=True)
         (sparse_fn1(x) + sparse_fn2(x)).sum().backward()
         self.assertEqual(x.grad, sparse_grad1 + sparse_grad2)
 
@@ -611,14 +622,95 @@ class TestAutograd(TestCase):
 
         TestFn.apply(b).sum().backward()
 
+    def test_free_deep_graph(self):
+        def scope():
+            depth = 150000
+            x = torch.randn(1, requires_grad=True)
+            y = x.clone()
+
+            # build a "chain" computation graph
+            for i in range(depth):
+                y = y + y * 0.000001
+
+            # graph deletion occurs when the above locals go out of scope.
+            # In this case `del y` will trigger it but it's easier to leave
+            # it to Python to delete the locals.
+
+        # Should not stack overflow
+        scope()
+
+    def test_free_deep_graph_complicated(self):
+        def scope():
+            depth = 100000
+            randchoice = torch.randint(2, [depth, 2])
+            x = torch.randn(1, requires_grad=True)
+            y = x.clone()
+
+            # Hold the two previous values
+            prev_values = [None, None]
+
+            # Build a "chain with skip connections" graph
+            for i in range(depth):
+                prev_tensors = [tensor for tensor in prev_values[:-1]
+                                if tensor is not None]
+                prev_values.append(y)
+                prev_values.pop(0)
+
+                # Definitely pick one tensor to add
+                y += y * 0.000001
+
+                # Possibly add other tensors
+                nprev = len(prev_tensors)
+                if nprev == 2:
+                    y += randchoice[depth].mul(torch.cat(prev_tensors)).sum()
+
+            # graph deletion occurs when the above locals go out of scope.
+
+        # Should not stack overflow
+        scope()
+
+    def test_free_deep_graph_pyfunction(self):
+        class MyOp(Function):
+            @staticmethod
+            def forward(ctx, tensor1, tensor2):
+                return tensor1 + tensor2
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                return grad_output, grad_output
+
+        def scope():
+            depth = 150000
+            x = torch.randn(1, requires_grad=True)
+            y = x.clone()
+
+            # build deeply nested computation graph
+            for i in range(depth):
+                y = MyOp.apply(y, y)
+
+            # graph deletion occurs when the above locals go out of scope.
+
+        # Should not stack overflow
+        scope()
+
     def test_no_grad(self):
         x = torch.ones(5, 5, requires_grad=True)
         y = Variable(torch.ones(5, 5) * 4)
         with torch.no_grad():
             w = x + y
+
+        @torch.no_grad()
+        def adder(x, y):
+            return x + y
+
+        z = adder(x, y)
+
         self.assertFalse(w.requires_grad)
         self.assertRaises(RuntimeError, lambda: w.backward(torch.ones(5, 5)))
         self.assertIsNone(w.grad_fn)
+        self.assertFalse(z.requires_grad)
+        self.assertRaises(RuntimeError, lambda: z.backward(torch.ones(5, 5)))
+        self.assertIsNone(z.grad_fn)
 
     def test_no_grad_python_function(self):
         """Python Functions should respect grad mode."""
@@ -638,7 +730,7 @@ class TestAutograd(TestCase):
         self.assertFalse(y.requires_grad)
 
     def test_indexing(self):
-        x = torch.arange(1, 17).view(4, 4)
+        x = torch.arange(1., 17).view(4, 4)
         y = Variable(x, requires_grad=True)
 
         def compare(x, y, idx, indexed_tensor, indexed_var):
@@ -681,7 +773,7 @@ class TestAutograd(TestCase):
         check_index(x, y, ([0]))
         check_index(x, y, ([0], ))
 
-        x = torch.arange(1, 49).view(4, 3, 4)
+        x = torch.arange(1., 49).view(4, 3, 4)
         y = Variable(x, requires_grad=True)
 
         check_index(x, y, (slice(None), [0], [0]))
@@ -717,7 +809,7 @@ class TestAutograd(TestCase):
         compare(x, y, seq, indexed_tensor, indexed_var)
 
     def test_indexing_duplicates(self):
-        x = torch.arange(1, 17).view(4, 4)
+        x = torch.arange(1., 17).view(4, 4)
         y = Variable(x, requires_grad=True)
 
         idx = torch.LongTensor([1, 1, 3, 2, 1, 2])
@@ -728,7 +820,7 @@ class TestAutograd(TestCase):
         self.assertEqual(y.grad.data, expected_grad)
 
         # with advanced indexing
-        x = torch.arange(1, 17).view(4, 4)
+        x = torch.arange(1., 17).view(4, 4)
         y = Variable(x, requires_grad=True)
 
         idx = [[1, 1, 3, 2, 1, 2], [0]]
@@ -740,7 +832,7 @@ class TestAutograd(TestCase):
 
         self.assertEqual(y.grad.data, expected_grad)
 
-        x = torch.arange(1, 17).view(4, 4)
+        x = torch.arange(1., 17).view(4, 4)
         y = Variable(x, requires_grad=True)
         idx = [[[1, 2], [0, 0]], [[0, 1], [1, 1]]]
         y[idx].sum().backward()
@@ -750,7 +842,7 @@ class TestAutograd(TestCase):
                                       [0, 0, 0, 0]])
         self.assertEqual(y.grad.data, expected_grad)
 
-        x = torch.arange(1, 65).view(4, 4, 4)
+        x = torch.arange(1., 65).view(4, 4, 4)
         y = Variable(x, requires_grad=True)
 
         idx = [[1, 1, 1], slice(None), slice(None)]
@@ -810,6 +902,29 @@ class TestAutograd(TestCase):
         x._backward_hooks['test'] = error
         y._backward_hooks['test'] = error
         b.backward(torch.ones(5, 5))
+
+    def test_requires_grad_(self):
+        x = torch.randn(5, 5)
+        y = torch.randn(5, 5, requires_grad=True)
+        self.assertIs(x, x.requires_grad_())
+        self.assertTrue(x.requires_grad)
+        self.assertIs(y, y.requires_grad_())
+        self.assertTrue(y.requires_grad)
+        self.assertIs(x, x.requires_grad_(True))
+        self.assertTrue(x.requires_grad)
+        self.assertIs(y, y.requires_grad_(True))
+        self.assertTrue(y.requires_grad)
+        z = x * y
+        self.assertRaises(RuntimeError, lambda: z.requires_grad_(False))
+        self.assertIs(z, z.requires_grad_())
+        self.assertTrue(z.requires_grad)
+        self.assertIs(z, z.requires_grad_(True))
+        self.assertTrue(z.requires_grad)
+
+        self.assertIs(x, x.requires_grad_(False))
+        self.assertFalse(x.requires_grad)
+        self.assertIs(y, y.requires_grad_(False))
+        self.assertFalse(y.requires_grad)
 
     def test_requires_grad_inplace(self):
         a = torch.randn(5, 5)
@@ -1266,6 +1381,12 @@ class TestAutograd(TestCase):
         Identity.apply(v).backward()
         self.assertEqual(device[0], 1)
 
+    @unittest.skipIf(torch.cuda.device_count() < 2, "no multi-GPU")
+    def test_inputbuffer_add_multigpu(self):
+        input = torch.randn(1).cuda(0).requires_grad_()
+        output = input.cuda(1) + input.cuda(1)
+        output.backward()
+
     def test_detach(self):
         x = torch.randn(10, 10, requires_grad=True)
         y = x + 2
@@ -1674,7 +1795,7 @@ class TestAutograd(TestCase):
         self.assertEqual(x.grad.data, torch.ones(x.size()))
 
     def test_set_grad_enabled(self):
-        x = torch.tensor([1], requires_grad=True)
+        x = torch.tensor([1.], requires_grad=True)
         with torch.set_grad_enabled(False):
             y = x * 2
         self.assertFalse(y.requires_grad)
@@ -1739,16 +1860,25 @@ class TestAutograd(TestCase):
                               lambda a, b, c, dim: torch.cat((a, b, c), dim),
                               True, f_args_variable, f_args_tensor)
 
-    def test_cat_empty(self):
+    def test_cat_empty_legacy(self):
         f_args_variable = (torch.randn(0, requires_grad=True),
                            torch.randn(S, S, requires_grad=True))
-        # gradgradcheck doesn't work (because gradcheck doesn't work for empty outputs?)
+        # gradgradcheck doesn't work, probably because legacy size tracking is wrong somewhere,
         # hence False passed below, but gradcheck checked explicitly.
         f_args_tensor = deepcopy(unpack_variables(f_args_variable))
-        run_functional_checks(self, "test_cat_empty", "cat",
+        run_functional_checks(self, "test_cat_empty_legacy", "cat",
                               lambda a, b: torch.cat((a, b)),
                               False, f_args_variable, f_args_tensor)
         self.assertTrue(gradcheck(lambda a, b: torch.cat((a, b)), f_args_variable, eps=1e-6, atol=PRECISION))
+
+    @skipIfNoZeroSize
+    def test_cat_empty(self):
+        f_args_variable = (torch.randn(0, S, requires_grad=True),
+                           torch.randn(S, S, requires_grad=True))
+        f_args_tensor = deepcopy(unpack_variables(f_args_variable))
+        run_functional_checks(self, "test_cat_empty", "cat",
+                              lambda a, b: torch.cat((a, b)),
+                              True, f_args_variable, f_args_tensor)
 
     @skipIfNoLapack
     def test_potrf(self):
@@ -1923,7 +2053,7 @@ class TestAutograd(TestCase):
             self.assertTrue(hasattr(x, key))
 
     def test_as_strided(self):
-        x = Variable(torch.arange(0, 25).view(5, 5), requires_grad=True)
+        x = Variable(torch.arange(0., 25).view(5, 5), requires_grad=True)
 
         def as_strided(x):
             return x.as_strided([3, 3], [6, 2], 2)
@@ -2116,6 +2246,104 @@ class TestAutograd(TestCase):
         # we should throw an exception if the output requires grad
         self.assertRaisesRegex(RuntimeError, 'out=', lambda: torch.mul(a, b, out=x))
 
+    def test_diagonal_derivative_requires_grad(self):
+        # test that the backward requires grad
+        # we do this is because diagonal_backward uses inplace
+        # operations and gradgradcheck does not catch whether
+        # they works as expected (it will succeed even if
+        # the gradient has requires_grad == False
+        a = torch.randn(5, 6, requires_grad=True)
+        b = torch.diagonal(a)**2
+        c = b.sum()
+        d, = torch.autograd.grad(c, a, retain_graph=True, create_graph=True)
+        self.assertTrue(d.requires_grad)
+
+    @staticmethod
+    def _test_set_requires_grad_only_for_floats(self, cuda):
+        dtypes = [torch.int64, torch.int32, torch.int16, torch.int8,
+                  torch.float, torch.double]
+        if cuda:
+            dtypes.append(torch.half)
+
+        def f1(dt):
+            a = torch.ones(1, dtype=dt, device='cuda' if cuda else 'cpu')
+            a.requires_grad_()
+
+        def f2(dt):
+            a = torch.ones(1, dtype=dt, device='cuda' if cuda else 'cpu')
+            a.requires_grad = True
+
+        def f3(dt):
+            torch.ones(1, dtype=dt, device='cuda' if cuda else 'cpu', requires_grad=True)
+
+        for dt in dtypes:
+            a = torch.ones(1, dtype=dt, device='cuda' if cuda else 'cpu')
+            a.requires_grad = False  # should always work
+            a.requires_grad_(False)
+
+            for f in [f1, f2, f3]:
+                if dt.is_floating_point:
+                    f(dt)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'floating point',
+                                                msg="dt: {} device: {}".format(a.dtype, a.device)):
+                        f(dt)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA unavailable")
+    def test_set_requires_grad_only_for_floats_cuda(self):
+        self._test_set_requires_grad_only_for_floats(self, True)
+
+    def test_set_requires_grad_only_for_floats(self):
+        self._test_set_requires_grad_only_for_floats(self, False)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA unavailable")
+    def test_rnn_backward_to_input_but_not_parameters_cuda(self):
+        # this checks whether it is possible to not require
+        # weight parameters, but require inputs, see #7722
+        dev = torch.device('cuda')
+        l = torch.nn.LSTM(2, 3).to(dev)
+        for p in l.parameters():
+            p.requires_grad = False
+        s = torch.randn(1, 1, 2, requires_grad=True, device=dev)
+        out, _ = l(s)
+        out.sum().backward()
+        self.assertFalse(s.grad is None or s.grad.abs().sum().item() == 0)
+
+    def test_anomaly_detect_nan(self):
+        size = 10
+
+        class MyFunc(Function):
+            @staticmethod
+            def forward(ctx, inp1, inp2, fail_0th):
+                ctx.fail_0th = fail_0th
+                return inp1.sum(0, keepdim=True)
+
+            @staticmethod
+            def backward(ctx, gO):
+                gI = gO.clone().expand(size)
+                gI[0] = 0
+                gI[0] /= 0  # Generate a nan
+                if ctx.fail_0th:
+                    return gI, None, None
+                else:
+                    return None, gI, None
+
+        inp = torch.rand(size, requires_grad=True)
+        out = MyFunc.apply(inp, inp, True)
+        out.backward()  # Should not fail
+
+        inp = torch.rand(size, requires_grad=True)
+        out = MyFunc.apply(inp, inp, True)
+        with self.assertRaisesRegexp(RuntimeError, "Function 'MyFuncBackward' returned nan values in its 0th output."):
+            with detect_anomaly():
+                out.backward()
+
+        inp = torch.rand(size, requires_grad=True)
+        out = MyFunc.apply(inp, inp, False)
+        with self.assertRaisesRegexp(RuntimeError, "Function 'MyFuncBackward' returned nan values in its 1th output."):
+            with detect_anomaly():
+                out.backward()
+
 
 def index_variable(shape, max_indices):
     if not isinstance(shape, tuple):
@@ -2212,7 +2440,7 @@ def make_nonzero_det(A, sign=None, min_singular_value=0.1):
 def random_fullrank_matrix_distinct_singular_value(l):
     A = torch.randn(l, l)
     u, _, v = A.svd()
-    s = torch.arange(1, l + 1).mul_(1.0 / (l + 1))
+    s = torch.arange(1., l + 1).mul_(1.0 / (l + 1))
     return u.mm(torch.diag(s)).mm(v.t())
 
 
@@ -2244,9 +2472,9 @@ S = 5
 #   method name,
 #   input size/constructing fn,
 #   args (tuple represents shape of a tensor arg),
-#   test variant name (will be used at test name suffix),  // optional
-#   indices for possible dim arg,                          // optional
-#   output indices that should be gradcheck'ed,            // optional
+#   test variant name (will be used at test name suffix),    // optional
+#   indices for possible dim arg,                            // optional
+#   fn mapping output to part that should be gradcheck'ed,   // optional
 # )
 method_tests = [
     ('add', (S, S, S), ((S, S, S),)),
@@ -2319,6 +2547,10 @@ method_tests = [
     ('reshape', (S,), (S,), '1d'),
     ('reshape', (), (dont_convert(()),), 'scalar_to_scalar'),
     ('reshape', (), (1,), 'scalar_to_1d'),
+    ('flip', (S, S, S), ([0],), 'd0'),
+    ('flip', (S, S, S), ([0, 1, 2],), 'd012'),
+    ('flip', (S, S, S), ([0, 2],), 'd02'),
+    ('flip', (S, S, S), ([2, 0],), 'd20'),
     ('view_as', (S, S, S), (non_differentiable(torch.rand(S * S, S)),)),
     ('view_as', (), (non_differentiable(torch.tensor(5.5)),), 'scalar'),
     ('view_as', (), (non_differentiable(torch.rand(1, 1)),), 'scalar_to_dims'),
@@ -2471,6 +2703,8 @@ method_tests = [
     ('sum', (), NO_ARGS, 'scalar'),
     ('sum', (), (0,), 'scalar_dim', [0]),
     ('sum', (), (0, True,), 'scalar_keepdim_dim', [0]),
+    ('sum', (S, S, S), ([1, 2],), 'multi_dim'),
+    ('sum', (S, S, S), ([1, 2], True,), 'multi_dim_keepdim'),
     ('prod', (S, S, S), NO_ARGS),
     ('prod', (S, S, S), (1,), 'dim', [0]),
     ('prod', (S, S, S), (1, True,), 'keepdim_dim', [0]),
@@ -2502,6 +2736,7 @@ method_tests = [
     ('std', (S,), (0, True, True), 'keepdim_dim_1d', [0]),
     ('renorm', (S, S, S), (2, 1, 0.5), 'dim', [1]),
     ('renorm', (S, S, S), (1, 2, 3), 'norm_1'),
+    ('renorm', (S, S, S), (float('inf'), 2, 0.5), 'norm_inf'),
     ('repeat', (S,), (2,), 'single_number'),
     ('repeat', (), (2, 3), 'scalar'),
     ('repeat', (2, 2), (3, 2)),
@@ -2521,32 +2756,34 @@ method_tests = [
     ('unfold', (S, S, S), (2, 3, 2), 'lastdim', [0]),
     ('addmm', (S, M), ((S, S), (S, M)),),
     ('addmm', (1,), ((S, S), (S, M)), 'broadcast_lhs'),
-    ('addmm', (S, M), (0.2, 0.6, (S, S), (S, M)), 'coef'),
-    ('addmm', (1,), (0.2, 0.6, (S, S), (S, M)), 'broadcast_lhs_coef'),
+    ('addmm', (S, M), ((S, S), (S, M)), 'coef', (), (), lambda x: x, {'beta': 0.2, 'alpha': 0.6}),
+    ('addmm', (1,), ((S, S), (S, M)), 'broadcast_lhs_coef', (), (), lambda x: x, {'beta': 0.2, 'alpha': 0.6}),
     ('addmm', (), ((S, S), (S, M)), 'scalar_broadcast_lhs'),
-    ('addmm', (), (0.2, 0.6, (S, S), (S, M)), 'scalar_broadcast_lhs_coef'),
+    ('addmm', (), ((S, S), (S, M)), 'scalar_broadcast_lhs_coef', (), (), lambda x: x, {'beta': 0.2, 'alpha': 0.6}),
     ('addbmm', (S, M), ((S, S, S), (S, S, M)),),
     ('addbmm', (1,), ((S, S, S), (S, S, M)), 'broadcast_lhs'),
-    ('addbmm', (S, M), (0.2, 0.6, (S, S, S), (S, S, M)), 'coef'),
-    ('addbmm', (1,), (0.2, 0.6, (S, S, S), (S, S, M)), 'broadcast_lhs_coef'),
+    ('addbmm', (S, M), ((S, S, S), (S, S, M)), 'coef', (), (), lambda x: x, {'beta': 0.2, 'alpha': 0.6}),
+    ('addbmm', (1,), ((S, S, S), (S, S, M)), 'broadcast_lhs_coef', (), (), lambda x: x, {'beta': 0.2, 'alpha': 0.6}),
     ('addbmm', (), ((S, S, S), (S, S, M)), 'scalar_broadcast_lhs'),
-    ('addbmm', (), (0.2, 0.6, (S, S, S), (S, S, M)), 'scalar_broadcast_lhs_coef'),
+    ('addbmm', (), ((S, S, S), (S, S, M)), 'scalar_broadcast_lhs_coef', (), (), lambda x: x,
+        {'beta': 0.2, 'alpha': 0.6}),
     ('baddbmm', (S, S, M), ((S, S, S), (S, S, M)),),
     ('baddbmm', (1,), ((S, S, S), (S, S, M)), 'broadcast_lhs'),
-    ('baddbmm', (S, S, M), (0.2, 0.6, (S, S, S), (S, S, M)), 'coef'),
-    ('baddbmm', (1,), (0.2, 0.6, (S, S, S), (S, S, M)), 'broadcast_lhs_coef'),
+    ('baddbmm', (S, S, M), ((S, S, S), (S, S, M)), 'coef', (), (), lambda x: x, {'beta': 0.2, 'alpha': 0.6}),
+    ('baddbmm', (1,), ((S, S, S), (S, S, M)), 'broadcast_lhs_coef', (), (), lambda x: x, {'beta': 0.2, 'alpha': 0.6}),
     ('baddbmm', (), ((S, S, S), (S, S, M)), 'scalar_broadcast_lhs'),
-    ('baddbmm', (), (0.2, 0.6, (S, S, S), (S, S, M)), 'scalar_broadcast_lhs_coef'),
+    ('baddbmm', (), ((S, S, S), (S, S, M)), 'scalar_broadcast_lhs_coef', (), (), lambda x: x,
+        {'beta': 0.2, 'alpha': 0.6}),
     ('addmv', (S,), ((S, M), (M,)),),
     ('addmv', (1,), ((S, M), (M,)), 'broadcast_lhs'),
-    ('addmv', (S,), (0.2, 0.6, (S, M), (M,)), 'coef'),
-    ('addmv', (1,), (0.2, 0.6, (S, M), (M,)), 'broadcast_lhs_coef'),
+    ('addmv', (S,), ((S, M), (M,)), 'coef', (), (), lambda x: x, {'beta': 0.2, 'alpha': 0.6}),
+    ('addmv', (1,), ((S, M), (M,)), 'broadcast_lhs_coef', (), (), lambda x: x, {'beta': 0.2, 'alpha': 0.6}),
     ('addmv', (), ((S, M), (M,)), 'scalar_broadcast_lhs'),
-    ('addmv', (), (0.2, 0.6, (S, M), (M,)), 'scalar_broadcast_lhs_coef'),
+    ('addmv', (), ((S, M), (M,)), 'scalar_broadcast_lhs_coef', (), (), lambda x: x, {'beta': 0.2, 'alpha': 0.6}),
     ('addr', (S, M), ((S,), (M,)),),
     ('addr', (), ((S,), (M,)), 'broadcast_lhs'),
-    ('addr', (S, M), (0.2, 0.6, (S,), (M,)), 'coef'),
-    ('addr', (), (0.2, 0.6, (S,), (M,)), 'broadcast_lhs_coef'),
+    ('addr', (S, M), ((S,), (M,)), 'coef', (), (), lambda x: x, {'beta': 0.2, 'alpha': 0.6}),
+    ('addr', (), ((S,), (M,)), 'broadcast_lhs_coef', (), (), lambda x: x, {'beta': 0.2, 'alpha': 0.6}),
     ('dot', (L,), ((L,),),),
     ('mm', (S, M), ((M, S),)),
     ('bmm', (M, S, M), ((M, M, S),)),
@@ -2562,34 +2799,36 @@ method_tests = [
     ('addcmul', (S, S), ((S, S), (S, S))),
     ('addcmul', (S, S), ((S, 1), (1, S)), 'broadcast_rhs'),
     ('addcmul', (1,), ((S, S, 1), (1, S)), 'broadcast_all'),
-    ('addcmul', (S, S), (0.5, (S, S), (S, S)), 'scale'),
-    ('addcmul', (S, S), (0.5, (S, 1), (1, S)), 'scale_broadcast_rhs'),
-    ('addcmul', (1,), (0.5, (S, S, 1), (1, S)), 'scale_broadcast_all'),
+    ('addcmul', (S, S), ((S, S), (S, S)), 'scale', (), (), lambda x: x, {'value': 0.5}),
+    ('addcmul', (S, S), ((S, 1), (1, S)), 'scale_broadcast_rhs', (), (), lambda x: x, {'value': 0.5}),
+    ('addcmul', (1,), ((S, S, 1), (1, S)), 'scale_broadcast_all', (), (), lambda x: x, {'value': 0.5}),
     ('addcmul', (), ((), ()), 'scalar'),
     ('addcmul', (S, S), ((), ()), 'scalar_broadcast_rhs'),
     ('addcmul', (), ((S, S, 1), (1, S)), 'scalar_broadcast_lhs'),
-    ('addcmul', (), (0.5, (), ()), 'scalar_scale'),
-    ('addcmul', (S, S), (0.5, (), ()), 'scalar_scale_broadcast_rhs'),
-    ('addcmul', (), (0.5, (S, S, 1), (1, S)), 'scalar_scale_broadcast_lhs'),
+    ('addcmul', (), ((), ()), 'scalar_scale', (), (), lambda x: x, {'value': 0.5}),
+    ('addcmul', (S, S), ((), ()), 'scalar_scale_broadcast_rhs', (), (), lambda x: x, {'value': 0.5}),
+    ('addcmul', (), ((S, S, 1), (1, S)), 'scalar_scale_broadcast_lhs', (), (), lambda x: x, {'value': 0.5}),
     ('addcdiv', (S, S), ((S, S), (S, S))),
     ('addcdiv', (S, S), ((S, 1), (1, S)), 'broadcast_rhs'),
     ('addcdiv', (1,), ((S, S, 1), (1, S)), 'broadcast_all'),
-    ('addcdiv', (S, S), (0.5, (S, S), (S, S)), 'scale'),
-    ('addcdiv', (S, S), (0.5, (S, 1), (1, S)), 'scale_broadcast_rhs'),
-    ('addcdiv', (1,), (0.5, (S, S, 1), (1, S)), 'scale_broadcast_all'),
+    ('addcdiv', (S, S), ((S, S), (S, S)), 'scale', (), (), lambda x: x, {'value': 0.5}),
+    ('addcdiv', (S, S), ((S, 1), (1, S)), 'scale_broadcast_rhs', (), (), lambda x: x, {'value': 0.5}),
+    ('addcdiv', (1,), ((S, S, 1), (1, S)), 'scale_broadcast_all', (), (), lambda x: x, {'value': 0.5}),
     ('addcdiv', (), ((), ()), 'scalar'),
     ('addcdiv', (S, S), ((), ()), 'scalar_broadcast_rhs'),
     ('addcdiv', (), ((S, S, 1), (1, S)), 'scalar_broadcast_lhs'),
-    ('addcdiv', (), (0.5, (), ()), 'scalar_scale'),
-    ('addcdiv', (S, S), (0.5, (), ()), 'scalar_scale_broadcast_rhs'),
-    ('addcdiv', (), (0.5, (S, S, 1), (1, S)), 'scalar_scale_broadcast_lhs'),
+    ('addcdiv', (), ((), ()), 'scalar_scale', (), (), lambda x: x, {'value': 0.5}),
+    ('addcdiv', (S, S), ((), ()), 'scalar_scale_broadcast_rhs', (), (), lambda x: x, {'value': 0.5}),
+    ('addcdiv', (), ((S, S, 1), (1, S)), 'scalar_scale_broadcast_lhs', (), (), lambda x: x, {'value': 0.5}),
     ('zero_', (S, S, S), NO_ARGS),
     ('zero_', (), NO_ARGS, 'scalar'),
+    ('logsumexp', (S, S), (1,)),
     ('norm', (S, S), (2,)),
     ('norm', (S, S), (0,), '0'),
     ('norm', (S, S), (0.5,), '0_5'),
     ('norm', (S, S), (1,), '1'),
     ('norm', (S, S), (3,), '3'),
+    ('norm', (S, S), (float('inf'),), 'inf'),
     ('norm', (S, S), (-1,), 'neg_1'),
     ('norm', (S, S), (-0.5,), 'neg_0_5'),
     ('norm', (S, S), (-1.5,), 'neg_1_5'),
@@ -2630,6 +2869,18 @@ method_tests = [
     ('diag', (M,), NO_ARGS, '1d'),
     ('diag', (M, M), (1,), '2d_1'),
     ('diag', (M, M), (2,), '2d_2'),
+    ('diagonal', (M, M), NO_ARGS, '2d'),
+    ('diagonal', (3, 5), NO_ARGS, '2d_wide'),
+    ('diagonal', (3, 5), (2,), '2d_wide_pos'),
+    ('diagonal', (3, 5), (-2,), '2d_wide_neg'),
+    ('diagonal', (5, 3), NO_ARGS, '2d_tall'),
+    ('diagonal', (5, 3), (2,), '2d_tall_pos'),
+    ('diagonal', (5, 3), (-2,), '2d_tall_neg'),
+    ('diagonal', (M, M), (1,), '2d_1'),
+    ('diagonal', (M, M), (2,), '2d_2'),
+    ('diagonal', (M, M, M), (1, 1, 2), '3d_1'),
+    ('diagonal', (M, M, M), (2, 0, 1), '3d_2'),
+    ('diagonal', (M, M, M), (-2, 0, 1), '3d_3'),
     ('tril', (M, M), NO_ARGS),
     ('tril', (M, M), (2,), 'idx'),
     ('triu', (M, M), NO_ARGS),
@@ -2677,19 +2928,36 @@ method_tests = [
      'symmetric_pd', NO_ARGS, [skipIfNoLapack]),
     ('logdet', lambda: make_nonzero_det(random_fullrank_matrix_distinct_singular_value(S), 1, 0), NO_ARGS,
      'distinct_singular_values', NO_ARGS, [skipIfNoLapack]),
-    ('slogdet', lambda: make_nonzero_det(torch.randn(1, 1), 1), NO_ARGS, '1x1_pos_det', NO_ARGS, [skipIfNoLapack], [1]),
+    ('slogdet', lambda: make_nonzero_det(torch.randn(1, 1), 1), NO_ARGS,
+     '1x1_pos_det', NO_ARGS, [skipIfNoLapack], itemgetter(1)),
     ('slogdet', lambda: make_nonzero_det(torch.randn(1, 1), -1), NO_ARGS,
-     '1x1_neg_det', NO_ARGS, [skipIfNoLapack], [1]),
-    ('slogdet', lambda: make_nonzero_det(torch.randn(S, S), 1), NO_ARGS, 'pos_det', NO_ARGS, [skipIfNoLapack], [1]),
-    ('slogdet', lambda: make_nonzero_det(torch.randn(S, S), -1), NO_ARGS, 'neg_det', NO_ARGS, [skipIfNoLapack], [1]),
+     '1x1_neg_det', NO_ARGS, [skipIfNoLapack], itemgetter(1)),
+    ('slogdet', lambda: make_nonzero_det(torch.randn(S, S), 1), NO_ARGS,
+     'pos_det', NO_ARGS, [skipIfNoLapack], itemgetter(1)),
+    ('slogdet', lambda: make_nonzero_det(torch.randn(S, S), -1), NO_ARGS,
+     'neg_det', NO_ARGS, [skipIfNoLapack], itemgetter(1)),
     ('slogdet', lambda: make_nonzero_det(random_symmetric_matrix(S)), NO_ARGS,
-     'symmetric', NO_ARGS, [skipIfNoLapack], [1]),
-    ('slogdet', lambda: random_symmetric_pd_matrix(S), NO_ARGS, 'symmetric_pd', NO_ARGS, [skipIfNoLapack], [1]),
+     'symmetric', NO_ARGS, [skipIfNoLapack], itemgetter(1)),
+    ('slogdet', lambda: random_symmetric_pd_matrix(S), NO_ARGS,
+     'symmetric_pd', NO_ARGS, [skipIfNoLapack], itemgetter(1)),
     ('slogdet', lambda: random_fullrank_matrix_distinct_singular_value(S), NO_ARGS,
-     'distinct_singular_values', NO_ARGS, [skipIfNoLapack], [1]),
+     'distinct_singular_values', NO_ARGS, [skipIfNoLapack], itemgetter(1)),
     ('svd', lambda: random_fullrank_matrix_distinct_singular_value(S), NO_ARGS, '', NO_ARGS, [skipIfNoLapack]),
-    ('svd', lambda: random_fullrank_matrix_distinct_singular_value(M), NO_ARGS, 'large', NO_ARGS, [skipIfNoLapack]),
+    ('svd', lambda: random_fullrank_matrix_distinct_singular_value(S)[:(S - 2)], NO_ARGS,
+     'wide', NO_ARGS, [skipIfNoLapack]),
+    ('svd', lambda: random_fullrank_matrix_distinct_singular_value(S)[:, :(S - 2)], NO_ARGS,
+     'tall', NO_ARGS, [skipIfNoLapack]),
+    ('svd', lambda: random_fullrank_matrix_distinct_singular_value(S)[:(S - 2)], (False,),
+     'wide_all', NO_ARGS, [skipIfNoLapack], lambda usv: (usv[0], usv[1], usv[2][:, :(S - 2)])),
+    ('svd', lambda: random_fullrank_matrix_distinct_singular_value(S)[:, :(S - 2)], (False,),
+     'tall_all', NO_ARGS, [skipIfNoLapack], lambda usv: (usv[0][:, :(S - 2)], usv[1], usv[2])),
+    ('svd', lambda: random_fullrank_matrix_distinct_singular_value(M), NO_ARGS,
+     'large', NO_ARGS, [skipIfNoLapack]),
     ('gesv', (S, S), ((S, S),), '', NO_ARGS, [skipIfNoLapack]),
+    ('gesv', (S, S, S), ((S, S, S),), 'batched', NO_ARGS, [skipIfNoLapack]),
+    ('gesv', (2, 3, S, S), ((2, 3, S, S),), 'batched_dims', NO_ARGS, [skipIfNoLapack]),
+    ('gesv', (2, 2, S, S), ((1, S, S),), 'batched_broadcast_A', NO_ARGS, [skipIfNoLapack]),
+    ('gesv', (1, S, S), ((2, 2, S, S),), 'batched_broadcast_b', NO_ARGS, [skipIfNoLapack]),
     ('fill_', (S, S, S), (1,), 'number'),
     ('fill_', (), (1,), 'number_scalar'),
     # FIXME: we should compute the derivative w.r.t torch.tensor(1)
@@ -2736,7 +3004,7 @@ method_tests = [
     ('select', (S, S, S), (1, 2), 'dim', [0]),
     ('select', (S,), (0, 2), '1d'),
     ('narrow', (S, S, S), (1, 2, 2), 'dim', [0]),
-    ('slice', (S, S, S), (-2, 1, -1, 2)),
+    ('narrow', (S, S, S), (1, 0, 0), 'empty_dim', [0], [skipIfNoZeroSize]),
     ('squeeze', (S, 1, S, 1), NO_ARGS),
     ('squeeze', (1, 1, 1, 1), NO_ARGS, 'input_sizes_are_ones'),
     ('squeeze', (S, 1, S, 1), (1,), '1_dim', [0]),
@@ -2833,7 +3101,7 @@ method_tests = [
 # TODO: clamp with min/max
 
 
-def create_input(call_args, requires_grad=True, non_contiguous=False):
+def create_input(call_args, requires_grad=True, non_contiguous=False, call_kwargs=None):
     if not isinstance(call_args, tuple):
         call_args = (call_args,)
 
@@ -2863,7 +3131,9 @@ def create_input(call_args, requires_grad=True, non_contiguous=False):
             return map_arg(arg())
         else:
             return arg
-    return tuple(map_arg(arg) for arg in call_args)
+    args_out = tuple(map_arg(arg) for arg in call_args)
+    kwargs_out = {k: map_arg(v) for k, v in call_kwargs.items()} if call_kwargs else {}
+    return args_out, kwargs_out
 
 
 def unpack_variables(args):
@@ -2995,17 +3265,20 @@ def run_functional_checks(test_case, test_name, name, apply_fn, run_grad_checks,
         test_case.assertEqual(self_variable.type(), self_variable.grad.type())
         test_case.assertEqual(self_variable.size(), self_variable.grad.size())
 
-for test in method_tests:
-    name, self_size, args = test[:3]
+
+def add_test(
+        name,
+        self_size,
+        args,
+        variant_name='',
+        dim_args_idx=(),
+        skipTestIf=(),
+        output_process_fn=lambda x: x,
+        kwargs=None):
+    kwargs = kwargs if kwargs else {}
     basic_test_name = 'test_' + name
-    if len(test) >= 4 and test[3] != '':
-        basic_test_name += '_' + test[3]
-
-    dim_args_idx = test[4] if len(test) >= 5 else []
-
-    skipTestIf = test[5] if len(test) >= 6 else []
-
-    test_output_indices = test[6] if len(test) >= 7 else None
+    if variant_name != '':
+        basic_test_name += '_' + variant_name
 
     for dim_perm in product([-1, 1], repeat=len(dim_args_idx)):
         test_name = basic_test_name
@@ -3016,32 +3289,29 @@ for test in method_tests:
         # for-loop bodies don't define scopes, so we have to save the variables
         # we want to close over in some way
         def do_test(self, name=name, self_size=self_size, args=new_args, test_name=test_name,
-                    test_output_indices=test_output_indices):
+                    output_process_fn=output_process_fn):
             def check(name):
                 is_magic_method = name[:2] == '__' and name[-2:] == '__'
                 is_inplace = name[-1] == "_" and not is_magic_method
-                self_variable = create_input((self_size,))[0]
+                self_variable = create_input((self_size,))[0][0]
                 # FixMe: run grad checks on inplace self
                 if is_inplace:
                     self_variable.requires_grad = False
                 # need to record this because methods can change the szie (e.g. unsqueeze)
-                args_variable = create_input(args, requires_grad=not is_inplace)
+                args_variable, kwargs_variable = create_input(args, requires_grad=not is_inplace, call_kwargs=kwargs)
                 self_tensor = deepcopy(self_variable.data)
                 args_tensor = deepcopy(unpack_variables(args_variable))
-                output_variable = getattr(self_variable, name)(*args_variable)
+                output_variable = getattr(self_variable, name)(*args_variable, **kwargs_variable)
                 if not exclude_tensor_method(name, test_name):
-                    output_tensor = getattr(self_tensor, name)(*args_tensor)
+                    output_tensor = getattr(self_tensor, name)(*args_tensor, **kwargs_variable)
                     if not isinstance(output_tensor, torch.Tensor) and not isinstance(output_tensor, tuple):
                         output_tensor = torch.DoubleTensor((output_tensor,))
                     self.assertEqual(unpack_variables(output_variable), output_tensor)
                     # TODO: check that both have changed after adding all inplace ops
 
                 def fn(*inputs):
-                    output = getattr(inputs[0], name)(*inputs[1:])
-                    if test_output_indices is None:
-                        return output
-                    else:
-                        return tuple(output[i] for i in test_output_indices)
+                    output = getattr(inputs[0], name)(*inputs[1:], **kwargs)
+                    return output_process_fn(output)
 
                 if not is_inplace and name not in EXCLUDE_GRADCHECK:
                     run_grad_and_gradgrad_checks(self, name, test_name, fn,
@@ -3051,10 +3321,7 @@ for test in method_tests:
                 if hasattr(torch, name) and name not in EXCLUDE_FUNCTIONAL:
                     def fn(*inputs):
                         output = getattr(torch, name)(*inputs)
-                        if test_output_indices is None:
-                            return output
-                        else:
-                            return tuple(output[i] for i in test_output_indices)
+                        return output_process_fn(output)
 
                     f_args_variable = (self_variable,) + args_variable
                     f_args_tensor = (self_tensor,) + args_tensor
@@ -3064,9 +3331,9 @@ for test in method_tests:
 
                 # check for correct type of input.data and input.grad.data
                 if not is_inplace:
-                    self_variable = create_input((self_size,), requires_grad=True)[0]
-                    args_variable = create_input(args, requires_grad=False)
-                    output_variable = getattr(self_variable, name)(*args_variable)
+                    self_variable = create_input((self_size,), requires_grad=True)[0][0]
+                    args_variable, kwargs_variable = create_input(args, requires_grad=False, call_kwargs=kwargs)
+                    output_variable = getattr(self_variable, name)(*args_variable, **kwargs_variable)
                     if isinstance(output_variable, torch.autograd.Variable):
                         output_variable.backward(randn_like(output_variable))
                         self.assertTrue(type(self_variable.data) == type(self_variable.grad.data))
@@ -3078,7 +3345,7 @@ for test in method_tests:
                     skip_inplace = ('broadcast_lhs' in test_name or
                                     'broadcast_all' in test_name)
                     if hasattr(torch.ones(1), inplace_name) and not skip_inplace:
-                        output_variable = getattr(self_variable, name)(*args_variable)
+                        output_variable = getattr(self_variable, name)(*args_variable, **kwargs_variable)
                         if not isinstance(output_variable, tuple):
                             output_variable = (output_variable,)
                         inplace_self_variable = deepcopy(self_variable)
@@ -3089,7 +3356,8 @@ for test in method_tests:
                                                            for i in inplace_args_variable)
 
                         inplace_output_variable = (
-                            getattr(inplace_self_variable_copy[0], inplace_name)(*inplace_args_variable_copy))
+                            getattr(inplace_self_variable_copy[0], inplace_name)(*inplace_args_variable_copy,
+                                                                                 **kwargs_variable))
                         if not isinstance(inplace_output_variable, tuple):
                             inplace_output_variable = (inplace_output_variable,)
                         self.assertEqual(inplace_output_variable, output_variable)
@@ -3127,6 +3395,8 @@ for test in method_tests:
 
         setattr(TestAutograd, test_name, do_test)
 
+for test in method_tests:
+    add_test(*test)
 
 if __name__ == '__main__':
     run_tests()

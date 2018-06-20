@@ -29,6 +29,20 @@ struct Parser {
         List<Expr>(makeList(range, std::move(inputs))),
         List<Attribute>(makeList(range, std::move(attributes))));
   }
+  // exp | expr, | expr, expr, ...
+  TreeRef parseExpOrExpList(int end) {
+    auto prefix = parseExp();
+    if(L.cur().kind == ',') {
+      std::vector<Expr> exprs = { prefix };
+      while(L.cur().kind != end) {
+        L.expect(',');
+        exprs.push_back(parseExp());
+      }
+      auto list = List<Expr>::create(prefix.range(), exprs);
+      prefix = ListLiteral::create(list.range(), list);
+    }
+    return prefix;
+  }
   // things like a 1.0 or a(4) that are not unary/binary expressions
   // and have higher precedence than all of them
   TreeRef parseBaseExp() {
@@ -46,8 +60,12 @@ struct Parser {
       } break;
       case '(': {
         L.next();
-        prefix = parseExp();
+        prefix = parseExpOrExpList(')');
         L.expect(')');
+      } break;
+      case '[': {
+        auto list = parseList('[', ',', ']', &Parser::parseExp);
+        prefix = ListLiteral::create(list.range(), List<Expr>(list));
       } break;
       case TK_FLOAT:
       case TK_INT:
@@ -170,16 +188,7 @@ struct Parser {
     return Const::create(t.range, t.text());
   }
   Expr parseAttributeValue() {
-    int kind = L.cur().kind;
-    switch (kind) {
-      case '[': {
-        auto list = parseList('[', ',', ']', &Parser::parseExp);
-        return ListLiteral::create(list.range(), List<Expr>(list));
-      }
-      default: {
-        return parseExp();
-      }
-    }
+    return parseExp();
   }
   void parseOperatorArguments(TreeList& inputs, TreeList& attributes) {
     L.expect('(');
@@ -230,15 +239,11 @@ struct Parser {
 
     return Slice::create(range, Expr(value), Maybe<Expr>(first), Maybe<Expr>(second));
   }
+
   TreeRef parseParam() {
-    auto typ = parseType();
-    if (L.cur().kind != TK_IDENT && typ->trees()[0]->kind() == TK_IDENT) {
-      // oops, it wasn't a type but just a param without any type specified
-      return Param::create(
-          typ->range(), Ident(typ->trees()[0]), Type(c(TK_INFERRED, typ->range(), {})));
-    }
+    auto typ = TensorType::create(L.cur().range);
     auto ident = parseIdent();
-    return Param::create(typ->range(), Ident(ident), Type(typ));
+    return Param::create(typ.range(), Ident(ident), Type(typ));
   }
 
   // 'first' has already been parsed since expressions can exist
@@ -246,7 +251,7 @@ struct Parser {
   // first[,other,lhs] = rhs
   Assign parseAssign(List<Expr> list) {
     auto red = parseOptionalReduction();
-    auto rhs = parseExp();
+    auto rhs = parseExpOrExpList(TK_NEWLINE);
     L.expect(TK_NEWLINE);
     return Assign::create(list.range(), list, AssignKind(red), Expr(rhs));
   }
@@ -302,9 +307,6 @@ struct Parser {
       list = c(TK_LIST, L.cur().range, {});
     }
     return list;
-  }
-  TreeRef parseType() {
-    return TensorType::create(SourceRange(std::make_shared<std::string>(""), 0, 0));
   }
   TreeRef parseIf() {
     auto r = L.cur().range;

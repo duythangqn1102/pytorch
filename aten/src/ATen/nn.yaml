@@ -72,11 +72,6 @@
   scalar_check:
     output: 'false'
 
-- name: hardshrink(Tensor self, Scalar lambd=0.5)
-  cname: HardShrink
-  scalar_check:
-    output: self_->isScalar()
-
 - name: hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1)
   cname: HardTanh
   has_inplace: True
@@ -96,13 +91,6 @@
     output: self_->isScalar()
     buffer: self_->isScalar()
 
-- name: log_softmax(Tensor self, int64_t dim)
-  cname: LogSoftMax
-  wrap_dim:
-    dim: self
-  scalar_check:
-    output: self_->isScalar()
-
 - name: prelu(Tensor self, Tensor weight)
   cname: PReLU
   scalar_check:
@@ -113,13 +101,6 @@
 - name: rrelu_with_noise(Tensor self, Tensor noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=false, Generator* generator=nullptr)
   cname: RReLU
   has_inplace: True
-  scalar_check:
-    output: self_->isScalar()
-
-- name: softmax(Tensor self, int64_t dim)
-  cname: SoftMax
-  wrap_dim:
-    dim: self
   scalar_check:
     output: self_->isScalar()
 
@@ -153,12 +134,12 @@
 - name: adaptive_max_pool3d(Tensor self, IntList[3] output_size)
   cname: VolumetricAdaptiveMaxPooling
 
-- name: avg_pool2d(Tensor self, IntList[2] kernel_size, IntList[2] stride={}, IntList[2] padding=0, bool ceil_mode=false, bool count_include_pad=false)
+- name: avg_pool2d(Tensor self, IntList[2] kernel_size, IntList[2] stride={}, IntList[2] padding=0, bool ceil_mode=false, bool count_include_pad=true)
   cname: SpatialAveragePooling
   default_init:
     stride: kernel_size
 
-- name: avg_pool3d(Tensor self, IntList[3] kernel_size, IntList[3] stride={}, IntList[3] padding=0, bool ceil_mode=false, bool count_include_pad=false)
+- name: avg_pool3d(Tensor self, IntList[3] kernel_size, IntList[3] stride={}, IntList[3] padding=0, bool ceil_mode=false, bool count_include_pad=true)
   cname: VolumetricAveragePooling
   default_init:
     stride: kernel_size

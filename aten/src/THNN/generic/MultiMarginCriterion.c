@@ -21,10 +21,10 @@ void THNN_(MultiMarginCriterion_updateOutput)(
   int64_t t, d;
   real sum;
 
-  THArgCheck((input->nDimension == 1) || (input->nDimension == 2), 2,
+  THArgCheck((input->_dim() == 1) || (input->_dim() == 2), 2,
 	     "vector or matrix expected");
 
-  if (input->nDimension == 1)
+  if (input->_dim() == 1)
   {
     nframe = 1;
     dim = input->size[0];
@@ -33,7 +33,7 @@ void THNN_(MultiMarginCriterion_updateOutput)(
   {
     nframe = input->size[0];
     dim = input->size[1];
-    THArgCheck((target->nDimension == 1) && (target->size[0] == nframe), 3,
+    THArgCheck((target->_dim() == 1) && (target->size[0] == nframe), 3,
 	       "inconsistent target size");
   }
 
@@ -75,7 +75,7 @@ void THNN_(MultiMarginCriterion_updateOutput)(
       }
 
       sum /= dim;
-      THTensor_fastSet1d(output, t, sum);
+      THTensor_(fastSet1d)(output, t, sum);
       input_data += dim;
     }
   }
@@ -138,10 +138,10 @@ void THNN_(MultiMarginCriterion_updateGradInput)(
   int64_t t, d;
   real g;
 
-  THArgCheck((input->nDimension == 1) || (input->nDimension == 2), 2,
+  THArgCheck((input->_dim() == 1) || (input->_dim() == 2), 2,
 	     "vector or matrix expected");
 
-  if (input->nDimension == 1)
+  if (input->_dim() == 1)
   {
     nframe = 1;
     dim = input->size[0];
@@ -150,7 +150,7 @@ void THNN_(MultiMarginCriterion_updateGradInput)(
   {
     nframe = input->size[0];
     dim = input->size[1];
-    THArgCheck((target->nDimension == 1) && (target->size[0] == nframe), 3,
+    THArgCheck((target->_dim() == 1) && (target->size[0] == nframe), 3,
 	       "inconsistent target size");
   }
 
@@ -201,7 +201,7 @@ void THNN_(MultiMarginCriterion_updateGradInput)(
   {
     THNN_CHECK_DIM_SIZE(gradOutput, 1, 0, 1);
     for (t = 0; t < nframe * dim; t++) {
-      gradInput_data[t] *= THTensor_fastGet1d(gradOutput, 0);
+      gradInput_data[t] *= THTensor_(fastGet1d)(gradOutput, 0);
     }
   }
   else
@@ -211,7 +211,7 @@ void THNN_(MultiMarginCriterion_updateGradInput)(
     {
       for (d = 0; d < dim; d++)
       {
-        gradInput_data[t * dim + d] *= THTensor_fastGet1d(gradOutput, t);
+        gradInput_data[t * dim + d] *= THTensor_(fastGet1d)(gradOutput, t);
       }
     }
   }

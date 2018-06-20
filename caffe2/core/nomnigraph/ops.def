@@ -45,6 +45,13 @@ Send
 Receive
 - Source : string
 
+BatchNormalization
+- Epsilon : float : 1e-5f
+- Momentum : float : 0.9f
+- Spatial : bool : true
+- IsTest : bool : false
+
+
 FC
 GivenTensorFill
 Concat
@@ -53,6 +60,9 @@ ChannelShuffle
 Add
 Reshape
 Flatten
+
+NCHW2NHWC
+NHWC2NCHW
 
 Int8Quantize
 Int8Dequantize

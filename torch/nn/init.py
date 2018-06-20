@@ -57,7 +57,7 @@ def uniform_(tensor, a=0, b=1):
         b: the upper bound of the uniform distribution
 
     Examples:
-        >>> w = torch.Tensor(3, 5)
+        >>> w = torch.empty(3, 5)
         >>> nn.init.uniform_(w)
     """
     with torch.no_grad():
@@ -74,7 +74,7 @@ def normal_(tensor, mean=0, std=1):
         std: the standard deviation of the normal distribution
 
     Examples:
-        >>> w = torch.Tensor(3, 5)
+        >>> w = torch.empty(3, 5)
         >>> nn.init.normal_(w)
     """
     with torch.no_grad():
@@ -89,11 +89,39 @@ def constant_(tensor, val):
         val: the value to fill the tensor with
 
     Examples:
-        >>> w = torch.Tensor(3, 5)
+        >>> w = torch.empty(3, 5)
         >>> nn.init.constant_(w, 0.3)
     """
     with torch.no_grad():
         return tensor.fill_(val)
+
+
+def ones_(tensor):
+    r"""Fills the input Tensor with ones`.
+
+    Args:
+        tensor: an n-dimensional `torch.Tensor`
+
+    Examples:
+        >>> w = torch.empty(3, 5)
+        >>> nn.init.ones_(w)
+    """
+    with torch.no_grad():
+        return tensor.fill_(1)
+
+
+def zeros_(tensor):
+    r"""Fills the input Tensor with zeros`.
+
+    Args:
+        tensor: an n-dimensional `torch.Tensor`
+
+    Examples:
+        >>> w = torch.empty(3, 5)
+        >>> nn.init.zeros_(w)
+    """
+    with torch.no_grad():
+        return tensor.zero_()
 
 
 def eye_(tensor):
@@ -105,14 +133,14 @@ def eye_(tensor):
         tensor: a 2-dimensional `torch.Tensor`
 
     Examples:
-        >>> w = torch.Tensor(3, 5)
+        >>> w = torch.empty(3, 5)
         >>> nn.init.eye_(w)
     """
     if tensor.ndimension() != 2:
         raise ValueError("Only tensors with 2 dimensions are supported")
 
     with torch.no_grad():
-        torch.eye(*tensor.shape, out=tensor)
+        torch.eye(*tensor.shape, out=tensor, requires_grad=tensor.requires_grad)
     return tensor
 
 
@@ -125,7 +153,7 @@ def dirac_(tensor):
         tensor: a {3, 4, 5}-dimensional `torch.Tensor`
 
     Examples:
-        >>> w = torch.Tensor(3, 16, 5, 5)
+        >>> w = torch.empty(3, 16, 5, 5)
         >>> nn.init.dirac_(w)
     """
     dimensions = tensor.ndimension()
@@ -184,7 +212,7 @@ def xavier_uniform_(tensor, gain=1):
         gain: an optional scaling factor
 
     Examples:
-        >>> w = torch.Tensor(3, 5)
+        >>> w = torch.empty(3, 5)
         >>> nn.init.xavier_uniform_(w, gain=nn.init.calculate_gain('relu'))
     """
     fan_in, fan_out = _calculate_fan_in_and_fan_out(tensor)
@@ -211,7 +239,7 @@ def xavier_normal_(tensor, gain=1):
         gain: an optional scaling factor
 
     Examples:
-        >>> w = torch.Tensor(3, 5)
+        >>> w = torch.empty(3, 5)
         >>> nn.init.xavier_normal_(w)
     """
     fan_in, fan_out = _calculate_fan_in_and_fan_out(tensor)
@@ -254,7 +282,7 @@ def kaiming_uniform_(tensor, a=0, mode='fan_in', nonlinearity='leaky_relu'):
             recommended to use only with 'relu' or 'leaky_relu' (default).
 
     Examples:
-        >>> w = torch.Tensor(3, 5)
+        >>> w = torch.empty(3, 5)
         >>> nn.init.kaiming_uniform_(w, mode='fan_in', nonlinearity='relu')
     """
     fan = _calculate_correct_fan(tensor, mode)
@@ -289,7 +317,7 @@ def kaiming_normal_(tensor, a=0, mode='fan_in', nonlinearity='leaky_relu'):
             recommended to use only with 'relu' or 'leaky_relu' (default).
 
     Examples:
-        >>> w = torch.Tensor(3, 5)
+        >>> w = torch.empty(3, 5)
         >>> nn.init.kaiming_normal_(w, mode='fan_out', nonlinearity='relu')
     """
     fan = _calculate_correct_fan(tensor, mode)
@@ -311,7 +339,7 @@ def orthogonal_(tensor, gain=1):
         gain: optional scaling factor
 
     Examples:
-        >>> w = torch.Tensor(3, 5)
+        >>> w = torch.empty(3, 5)
         >>> nn.init.orthogonal_(w)
     """
     if tensor.ndimension() < 2:
@@ -353,24 +381,21 @@ def sparse_(tensor, sparsity, std=0.01):
             the non-zero values
 
     Examples:
-        >>> w = torch.Tensor(3, 5)
+        >>> w = torch.empty(3, 5)
         >>> nn.init.sparse_(w, sparsity=0.1)
     """
     if tensor.ndimension() != 2:
         raise ValueError("Only tensors with 2 dimensions are supported")
 
     rows, cols = tensor.shape
-    num_zeros = int(math.ceil(rows * sparsity))
+    num_zeros = int(math.ceil(sparsity * rows))
 
     with torch.no_grad():
         tensor.normal_(0, std)
         for col_idx in range(cols):
-            row_indices = list(range(rows))
-            random.shuffle(row_indices)
+            row_indices = torch.randperm(rows)
             zero_indices = row_indices[:num_zeros]
-            for row_idx in zero_indices:
-                tensor[row_idx, col_idx] = 0
-
+            tensor[zero_indices, col_idx] = 0
     return tensor
 
 

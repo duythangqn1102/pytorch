@@ -232,11 +232,9 @@ def avg_pool1d(input, kernel_size, stride=None, padding=0,
 
     Example::
         >>> # pool of square window of size=3, stride=2
-        >>> input = torch.Tensor([[[1,2,3,4,5,6,7]]])
+        >>> input = torch.tensor([[[1,2,3,4,5,6,7]]])
         >>> F.avg_pool1d(input, kernel_size=3, stride=2)
-        (0 ,.,.) =
-          2  4  6
-        [torch.FloatTensor of size (1,1,3)]
+        tensor([[[ 2.,  4.,  6.]]])
     """
     if input.dim() != 3:
         raise ValueError('expected 3D input (got {} dimensions)'
@@ -409,7 +407,7 @@ def max_unpool1d(input, indices, kernel_size, stride=None, padding=0,
     See :class:`~torch.nn.MaxUnpool1d` for details.
     """
     kernel_size = _single(kernel_size)
-    stride = _single(stride)
+    stride = _single(stride or kernel_size)
     padding = _single(padding)
     output_size = _unpool_output_size(input, kernel_size, stride, padding,
                                       output_size)
@@ -423,7 +421,7 @@ def max_unpool2d(input, indices, kernel_size, stride=None, padding=0,
     See :class:`~torch.nn.MaxUnpool2d` for details.
     """
     kernel_size = _pair(kernel_size)
-    stride = _pair(stride)
+    stride = _pair(stride or kernel_size)
     padding = _pair(padding)
     output_size = _unpool_output_size(input, kernel_size, stride, padding,
                                       output_size)
@@ -437,7 +435,7 @@ def max_unpool3d(input, indices, kernel_size, stride=None, padding=0,
     See :class:`~torch.nn.MaxUnpool3d` for details.
     """
     kernel_size = _triple(kernel_size)
-    stride = _triple(stride)
+    stride = _triple(stride or kernel_size)
     padding = _triple(padding)
     output_size = _unpool_output_size(input, kernel_size, stride, padding,
                                       output_size)
@@ -446,23 +444,25 @@ def max_unpool3d(input, indices, kernel_size, stride=None, padding=0,
 
 def lp_pool2d(input, norm_type, kernel_size, stride=None, ceil_mode=False):
     r"""Applies a 2D power-average pooling over an input signal composed of
-    several input planes.
+    several input planes. If the sum of all inputs to the power of `p` is
+    zero, the gradient is set to zero as well.
 
     See :class:`~torch.nn.LPPool2d` for details.
     """
     kw, kh = utils._pair(kernel_size)
     out = avg_pool2d(input.pow(norm_type), kernel_size, stride, 0, ceil_mode)
-    return out.mul(kw * kh).pow(1. / norm_type)
+    return (torch.sign(out) * relu(torch.abs(out))).mul(kw * kh).pow(1. / norm_type)
 
 
 def lp_pool1d(input, norm_type, kernel_size, stride=None, ceil_mode=False):
     r"""Applies a 1D power-average pooling over an input signal composed of
-    several input planes.
+    several input planes. If the sum of all inputs to the power of `p` is
+    zero, the gradient is set to zero as well.
 
     See :class:`~torch.nn.LPPool1d` for details.
     """
     out = avg_pool1d(input.pow(norm_type), kernel_size, stride, 0, ceil_mode)
-    return out.mul(kernel_size).pow(1. / norm_type)
+    return (torch.sign(out) * relu(torch.abs(out))).mul(kernel_size).pow(1. / norm_type)
 
 
 def adaptive_max_pool1d(input, output_size, return_indices=False):
@@ -611,7 +611,7 @@ In-place version of :func:`~threshold`.
 
 
 def relu(input, inplace=False):
-    r"""relu(input, threshold, value, inplace=False) -> Tensor
+    r"""relu(input, inplace=False) -> Tensor
 
     Applies the rectified linear unit function element-wise. See
     :class:`~torch.nn.ReLU` for more details.
@@ -777,13 +777,16 @@ Applies element-wise :math:`\text{LogSigmoid}(x) = \log \left(\frac{1}{1 + \exp(
 See :class:`~torch.nn.LogSigmoid` for more details.
 """)
 
-hardshrink = _add_docstr(torch._C._nn.hardshrink, r"""
-hardshrink(input, lambd=0.5) -> Tensor
 
-Applies the hard shrinkage function element-wise
+def hardshrink(input, lambd=0.5):
+    r"""
+    hardshrink(input, lambd=0.5) -> Tensor
 
-See :class:`~torch.nn.Hardshrink` for more details.
-""")
+    Applies the hard shrinkage function element-wise
+
+    See :class:`~torch.nn.Hardshrink` for more details.
+    """
+    return torch.hardshrink(input, lambd)
 
 
 def tanhshrink(input):
@@ -834,7 +837,7 @@ def softmin(input, dim=None, _stacklevel=3):
     """
     if dim is None:
         dim = _get_softmax_dim('softmin', input.dim(), _stacklevel)
-    return torch._C._nn.softmax(-input, dim)
+    return -input.softmax(dim)
 
 
 def softmax(input, dim=None, _stacklevel=3):
@@ -861,7 +864,7 @@ def softmax(input, dim=None, _stacklevel=3):
     """
     if dim is None:
         dim = _get_softmax_dim('softmax', input.dim(), _stacklevel)
-    return torch._C._nn.softmax(input, dim)
+    return input.softmax(dim)
 
 
 def _sample_gumbel(shape, eps=1e-10, out=None):
@@ -891,21 +894,25 @@ def _gumbel_softmax_sample(logits, tau=1, eps=1e-10):
 
 
 def gumbel_softmax(logits, tau=1, hard=False, eps=1e-10):
-    """
+    r"""
     Sample from the Gumbel-Softmax distribution and optionally discretize.
+
     Args:
-      logits: `[batch_size, n_class]` unnormalized log-probs
+      logits: `[batch_size, num_features]` unnormalized log probabilities
       tau: non-negative scalar temperature
-      hard: if ``True``, take `argmax`, but differentiate w.r.t. soft sample y
+      hard: if ``True``, the returned samples will be discretized as one-hot vectors,
+            but will be differentiated as if it is the soft sample in autograd
+
     Returns:
-      [batch_size, n_class] sample from the Gumbel-Softmax distribution.
-      If hard=True, then the returned sample will be one-hot, otherwise it will
-      be a probability distribution that sums to 1 across classes
+      Sampled tensor of shape ``batch_size x num_features`` from the Gumbel-Softmax distribution.
+      If ``hard=True``, the returned samples will be one-hot, otherwise they will
+      be probability distributions that sum to 1 across features
 
     Constraints:
-    - this implementation only works on batch_size x num_features tensor for now
 
-    based on
+    - Currently only work on 2D input :attr:`logits` tensor of shape ``batch_size x num_features``
+
+    Based on
     https://github.com/ericjang/gumbel-softmax/blob/3c8584924603869e90ca74ac20a6a03d99a91ef9/Categorical%20VAE.ipynb ,
     (MIT license)
     """
@@ -943,7 +950,7 @@ def log_softmax(input, dim=None, _stacklevel=3):
     """
     if dim is None:
         dim = _get_softmax_dim('log_softmax', input.dim(), _stacklevel)
-    return torch._C._nn.log_softmax(input, dim)
+    return input.log_softmax(dim)
 
 
 softshrink = _add_docstr(torch._C._nn.softshrink, r"""
@@ -979,10 +986,11 @@ def sigmoid(input):
 # etc.
 
 def linear(input, weight, bias=None):
-    """
+    r"""
     Applies a linear transformation to the incoming data: :math:`y = xA^T + b`.
 
     Shape:
+
         - Input: :math:`(N, *, in\_features)` where `*` means any number of
           additional dimensions
         - Weight: :math:`(out\_features, in\_features)`
@@ -1011,65 +1019,56 @@ def embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2,
     The input to the module is a list of indices, and the embedding matrix,
     and the output is the corresponding word embeddings.
 
+    See :class:`torch.nn.Embedding` for more details.
+
     Args:
-        input: tensor, containing indices into the embedding matrix
-        weight:
+        input (LongTensor): Tensor containing indices into the embedding matrix
+        weight (Tensor): The embedding matrix
             Number of rows should correspond to the maximum possible index + 1,
             number of columns is the embedding size
-        padding_idx (int, optional): Entries at the given index do not contribute to the gradient
-        max_norm (float, optional): If given, will renormalize the embeddings to always have a norm lesser than this
-        norm_type (float, optional): The p of the p-norm to compute for the max_norm option
-        scale_grad_by_freq (boolean, optional): if given, this will scale gradients by the frequency of
-                                                the words in the mini-batch.
-        sparse (boolean, optional): if ``True``, gradient w.r.t. weight matrix will be a sparse tensor. See Notes for
-                                    more details regarding sparse gradients.
+        padding_idx (int, optional): If given, pads the output with the embedding vector at :attr:`padding_idx`
+                                         (initialized to zeros) whenever it encounters the index.
+        max_norm (float, optional): If given, will renormalize the embedding vectors to have a norm lesser than
+                                    this before extracting. Note: this will modify :attr:`weight` in-place.
+        norm_type (float, optional): The p of the p-norm to compute for the max_norm option. Default ``2``.
+        scale_grad_by_freq (boolean, optional): if given, this will scale gradients by the inverse of frequency of
+                                                the words in the mini-batch. Default ``False``.
+        sparse (bool, optional): if ``True``, gradient w.r.t. :attr:`weight` will be a sparse tensor. See Notes under
+                                 :class:`torch.nn.Embedding` for more details regarding sparse gradients.
 
     Shape:
-        - Input: LongTensor `(N, W)`, N = mini-batch, W = number of indices to extract per mini-batch
-        - Embedding_matrix: FloatTensor `(V, embedding_dim)`, V = maximum index + 1, embedding_dim = embedding size
-        - Output: `(N, W, embedding_dim)`
-
-    Notes:
-        It is advised to only use `sparse=True` if `embedding_matrix` is a leaf Tensor,
-        since some autograd functions may not propagate sparse gradients correctly.
-        Additionally, keep in mind that only a limited number of optimizers support
-        sparse gradients: currently it's :class:`optim.SGD` (`CUDA` and `CPU`), and :class:`optim.Adagrad` (`CPU`)
+        - Input: LongTensor of arbitrary shape containing the indices to extract
+        - Weight: Embedding matrix of floating point type with shape `(V, embedding_dim)`,
+                            where V = maximum index + 1 and embedding_dim = the embedding size
+        - Output: `(*, embedding_dim)`, where `*` is the input shape
 
     Examples::
 
         >>> # a batch of 2 samples of 4 indices each
-        >>> input = torch.LongTensor([[1,2,4,5],[4,3,2,9]])
+        >>> input = torch.tensor([[1,2,4,5],[4,3,2,9]])
         >>> # an embedding matrix containing 10 tensors of size 3
         >>> embedding_matrix = torch.rand(10, 3)
         >>> F.embedding(input, embedding_matrix)
+        tensor([[[ 0.8490,  0.9625,  0.6753],
+                 [ 0.9666,  0.7761,  0.6108],
+                 [ 0.6246,  0.9751,  0.3618],
+                 [ 0.4161,  0.2419,  0.7383]],
 
-        (0 ,.,.) =
-         -1.0822  1.2522  0.2434
-          0.8393 -0.6062 -0.3348
-          0.6597  0.0350  0.0837
-          0.5521  0.9447  0.0498
-
-        (1 ,.,.) =
-          0.6597  0.0350  0.0837
-         -0.1527  0.0877  0.4260
-          0.8393 -0.6062 -0.3348
-         -0.8738 -0.9054  0.4281
-        [torch.FloatTensor of size (2,4,3)]
+                [[ 0.6246,  0.9751,  0.3618],
+                 [ 0.0237,  0.7794,  0.0528],
+                 [ 0.9666,  0.7761,  0.6108],
+                 [ 0.3385,  0.8612,  0.1867]]])
 
         >>> # example with padding_idx
         >>> weights = torch.rand(10, 3)
         >>> weights[0, :].zero_()
         >>> embedding_matrix = weights
-        >>> input = torch.LongTensor([[0,2,0,5]])
+        >>> input = torch.tensor([[0,2,0,5]])
         >>> F.embedding(input, embedding_matrix, padding_idx=0)
-
-        (0 ,.,.) =
-          0.0000  0.0000  0.0000
-          0.3452  0.4937 -0.9361
-          0.0000  0.0000  0.0000
-          0.0706 -2.1962 -0.6276
-        [torch.FloatTensor of size (1,4,3)]
-
+        tensor([[[ 0.0000,  0.0000,  0.0000],
+                 [ 0.5609,  0.5384,  0.8720],
+                 [ 0.0000,  0.0000,  0.0000],
+                 [ 0.6262,  0.2438,  0.7471]]])
     """
     input = input.contiguous()
     if padding_idx is not None:
@@ -1086,94 +1085,117 @@ def embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2,
     return torch.embedding(weight, input, padding_idx, scale_grad_by_freq, sparse)
 
 
-def embedding_bag(embedding_matrix, indices, offsets=None,
-                  max_norm=None, norm_type=2, scale_grad_by_freq=False, mode='mean', sparse=False):
+def embedding_bag(input, weight, offsets=None, max_norm=None, norm_type=2,
+                  scale_grad_by_freq=False, mode='mean', sparse=False):
     r"""Computes sums or means of 'bags' of embeddings, without instantiating the
-        intermediate embeddings.
+    intermediate embeddings.
 
-        For bags of constant length,
-            * :func:`embedding_bag` with `mode=sum` is equivalent to :func:`nn.functional.embedding` followed by
-              ``torch.sum(dim=1)``
-            * with `mode=mean` is equivalent to :func:`nn.functional.embedding` followed by ``torch.mean(dim=1)``
+    See :class:`torch.nn.EmbeddingBag` for more details.
 
-        However, :func:`embedding_bag` is much more time and memory efficient than using a chain of these
-        operations.
+    Args:
+        input (LongTensor): Tensor containing bags of indices into the embedding matrix
+        weight (Tensor): The embedding matrix
+            Number of rows should correspond to the maximum possible index + 1,
+            number of columns is the embedding size
+        offsets (LongTensor, optional): Only used when :attr:`input` is 1D. :attr:`offsets` determines
+                             the starting index position of each bag (sequence) in :attr:`input`.
+        max_norm (float, optional): If given, will renormalize the embedding vectors to have a norm lesser than
+                                    this before extracting. Note: this will modify :attr:`weight` in-place.
+        norm_type (float, optional): The ``p`` in the ``p``-norm to compute for the max_norm option. Default ``2``.
+        scale_grad_by_freq (boolean, optional): if given, this will scale gradients by the inverse of frequency of
+                                                the words in the mini-batch. Default ``False``.
+                                                Note: this option is not supported when ``mode="max"``.
+        mode (string, optional): ``"sum"``, ``"mean"`` or ``"max"``. Specifies the way to reduce the bag.
+                                 Default: ``"mean"``
+        sparse (bool, optional): if ``True``, gradient w.r.t. :attr:`weight` will be a sparse tensor. See Notes under
+                                 :class:`torch.nn.Embedding` for more details regarding sparse gradients.
+                                 Note: this option is not supported when ``mode="max"``.
 
-        Args:
-            embedding_matrix: FloatTensor, where number of rows should correspond to the maximum possible index + 1,
-                              number of columns is the embedding size
-            indices (N or BxN): LongTensor containing the indices of the embeddings to extract.
-                                When `input` is 1D Tensor of shape `N`, an `offsets` Tensor is given, that contains the
-                                starting position of each new sequence in the mini-batch.
-            offsets (B or None): LongTensor containing the starting positions of each sample in a mini-batch of variable
-                                 length sequences. If `input` is 2D (BxN), then offsets does not need to be given,
-                                 as the `input` is treated as a mini-batch of fixed length sequences of length `N` each.
-            max_norm (float, optional): If given, will renormalize the embeddings to always have a norm lesser than this
-            norm_type (float, optional): The p of the p-norm to compute for the max_norm option
-            scale_grad_by_freq (boolean, optional): if given, this will scale gradients by the frequency of
-                                                    the words in the dictionary.
-            mode (string, optional): 'sum' | 'mean'. Specifies the way to reduce the bag. Default: 'mean'
-            sparse (boolean, optional): if ``True``, gradient w.r.t. weight matrix will be a sparse tensor. See Notes
-                                        for more details regarding sparse gradients.
+    Shape:
 
-        Shape:
-            - Embedding_matrix: FloatTensor `(V, embedding_dim)`,
-                                V = number of embeddings, embedding_dim = embedding size
-            - Input: LongTensor `N`, N = number of embeddings to extract
-                     (or) LongTensor `BxN`, B = number of sequences in mini-batch,
-                                            N = number of embeddings per sequence
-            - Offsets: LongTensor `B`, B = number of bags. The values are the
-                       offsets in `input` for each bag, i.e. the cumsum of lengths.
-                       Offsets is not given if Input is 2D `BxN` Tensor,
-                       the input is considered to be of fixed-length sequences
-            - Output: `(B, embedding_dim)`
+        - :attr:`input` (LongTensor) and :attr:`offsets` (LongTensor, optional)
 
-        Examples::
+          - If :attr:`input` is 2D of shape ``B x N``,
 
-            >>> # an Embedding module containing 10 tensors of size 3
-            >>> embedding_matrix = torch.rand(10, 3)
-            >>> # a batch of 2 samples of 4 indices each
-            >>> input = torch.LongTensor([1,2,4,5,4,3,2,9])
-            >>> offsets = torch.LongTensor([0,4])
-            >>> embedding_bag(embedding_matrix, input, offsets)
+            it will be treated as ``B`` bags (sequences) each of fixed length ``N``, and
+            this will return ``B`` values aggregated in a way depending on the :attr:`mode`.
+            :attr:`offsets` is ignored and required to be ``None`` in this case.
 
-            -1.1840 -0.2547 -0.5860
-            -0.7126  0.0002 -0.3411
-            [torch.FloatTensor of size (2,3)]
+          - If :attr:`input` is 1D of shape ``N``,
 
-        """
-    if indices.dim() == 2:
+            it will be treated as a concatenation of multiple bags (sequences).
+            :attr:`offsets` is required to be a 1D tensor containing the
+            starting index positions of each bag in :attr:`input`. Therefore,
+            for :attr:`offsets` of shape ``B``, :attr:`input` will be viewed as
+            having ``B`` bags. Empty bags (i.e., having 0-length) will have
+            returned vectors filled by zeros.
+
+        - :attr:`weight` (Tensor): the learnable weights of the module of
+          shape ``(num_embeddings x embedding_dim)``
+
+        - :attr:`output`: aggregated embedding values of shape ``B x embedding_dim``
+
+    Examples::
+
+        >>> # an Embedding module containing 10 tensors of size 3
+        >>> embedding_matrix = torch.rand(10, 3)
+        >>> # a batch of 2 samples of 4 indices each
+        >>> input = torch.tensor([1,2,4,5,4,3,2,9])
+        >>> offsets = torch.tensor([0,4])
+        >>> F.embedding_bag(embedding_matrix, input, offsets)
+        tensor([[ 0.3397,  0.3552,  0.5545],
+                [ 0.5893,  0.4386,  0.5882]])
+    """
+    # Check for backward compatibility.
+    # Used to be embedding_bag(weight, input, ...)
+    # Now is     embedding_bag(input, weight, ...)
+    if weight.dtype == torch.long and input.is_floating_point():
+        warnings.warn("Argument order of nn.functional.embedding_bag was changed. "
+                      "Usage `embedding_bag(weight, input, ...)` is deprecated, "
+                      "and should now be `embedding_bag(input, weight, ...)`.")
+        weight, input = input, weight
+
+    if input.dim() == 2:
         if offsets is not None:
             raise ValueError("if input is 2D, then offsets has to be None"
                              ", as input is treated is a mini-batch of"
                              " fixed length sequences. However, found "
                              "offsets of type {}".format(type(offsets)))
         else:
-            offsets = torch.arange(0, indices.numel(), indices.size(1),
-                                   dtype=torch.long, device=indices.device)
+            offsets = torch.arange(0, input.numel(), input.size(1),
+                                   dtype=torch.long, device=input.device)
 
-            indices = indices.view(-1)
-    elif indices.dim() == 1:
+            input = input.view(-1)
+    elif input.dim() == 1:
         if offsets is None:
             raise ValueError("offsets has to be a 1D Tensor but got None")
         if offsets.dim() != 1:
             raise ValueError("offsets has to be a 1D Tensor")
-        if offsets[0] != 0:
-            raise ValueError("offsets[0] has to be 0, i.e. the first sequence"
-                             " in the mini-batch has to start from position 0."
-                             "However, got {}".format(offsets[0]))
-        if offsets[-1] > indices.size(0):
-            raise ValueError("offsets[-1] has to be smaller than indices's length"
+        if offsets[0].item() != 0:
+            raise ValueError("offsets[0] has to be 0, i.e., the first sequence "
+                             "in the mini-batch has to start from position 0. "
+                             "However, got {}".format(offsets[0].item()))
+        if offsets[-1].item() > input.size(0):
+            raise ValueError("offsets[-1] can not be greater than input's length"
                              " ({}), but got offsets[-1] of {}"
-                             .format(indices.size(0), offsets[-1]))
+                             .format(input.size(0), offsets[-1].item()))
     else:
         raise ValueError("input has to be 1D or 2D Tensor,"
-                         " but got Tensor of dimension {}".format(indices.dim()))
+                         " but got Tensor of dimension {}".format(input.dim()))
 
     if mode == 'sum':
         mode = 0
     elif mode == 'mean':
         mode = 1
+    elif mode == 'max':
+        mode = 2
+
+        if scale_grad_by_freq:
+            raise ValueError("max mode does not support scaling the gradient by the frequency")
+
+        if sparse:
+            raise ValueError("max mode does not support sparse weights")
+
     else:
         raise ValueError("mode has to be one of sum or mean")
 
@@ -1181,9 +1203,9 @@ def embedding_bag(embedding_matrix, indices, offsets=None,
         with torch.no_grad():
             torch.embedding_renorm_(weight, input, max_norm, norm_type)
 
-    ret, _, _ = torch.embedding_bag(
-        embedding_matrix,
-        indices,
+    ret, _, _, _ = torch.embedding_bag(
+        weight,
+        input,
         offsets,
         scale_grad_by_freq,
         mode,
@@ -1328,9 +1350,9 @@ def nll_loss(input, target, weight=None, size_average=True, ignore_index=-100, r
     Example::
 
         >>> # input is of size N x C = 3 x 5
-        >>> input = torch.randn(3, 5)
+        >>> input = torch.randn(3, 5, requires_grad=True)
         >>> # each element in target has to have 0 <= value < C
-        >>> target = torch.LongTensor([1, 0, 4])
+        >>> target = torch.tensor([1, 0, 4])
         >>> output = F.nll_loss(F.log_softmax(input), target)
         >>> output.backward()
     """
@@ -1448,7 +1470,7 @@ def cross_entropy(input, target, weight=None, size_average=True, ignore_index=-1
     Examples::
 
         >>> input = torch.randn(3, 5, requires_grad=True)
-        >>> target = torch.LongTensor(3).random_(5)
+        >>> target = torch.randint(5, (3,), dtype=torch.int64)
         >>> loss = F.cross_entropy(input, target)
         >>> loss.backward()
     """
@@ -1477,8 +1499,8 @@ def binary_cross_entropy(input, target, weight=None, size_average=True, reduce=T
 
     Examples::
 
-        >>> input = torch.randn(3, requires_grad=True)
-        >>> target = torch.LongTensor(3).random_(2)
+        >>> input = torch.randn((3, 2), requires_grad=True)
+        >>> target = torch.rand((3, 2), requires_grad=False)
         >>> loss = F.binary_cross_entropy(F.sigmoid(input), target)
         >>> loss.backward()
     """
@@ -1519,7 +1541,7 @@ def binary_cross_entropy_with_logits(input, target, weight=None, size_average=Tr
     Examples::
 
          >>> input = torch.randn(3, requires_grad=True)
-         >>> target = torch.FloatTensor(3).random_(2)
+         >>> target = torch.empty(3).random_(2)
          >>> loss = F.binary_cross_entropy_with_logits(input, target)
          >>> loss.backward()
     """
@@ -1657,7 +1679,7 @@ def pixel_shuffle(input, upscale_factor):
     Examples::
 
         >>> ps = nn.PixelShuffle(3)
-        >>> input = torch.Tensor(1, 9, 4, 4)
+        >>> input = torch.empty(1, 9, 4, 4)
         >>> output = ps(input)
         >>> print(output.size())
         torch.Size([1, 1, 12, 12])
@@ -1920,7 +1942,7 @@ def pad(input, pad, mode='constant', value=0):
 
     Examples::
 
-        >>> t4d = torch.Tensor(3, 3, 4, 2)
+        >>> t4d = torch.empty(3, 3, 4, 2)
         >>> p1d = (1, 1) # pad last dim by 1 on each side
         >>> out = F.pad(t4d, p1d, "constant", 0)  # effectively zero padding
         >>> print(out.data.size())
@@ -1929,7 +1951,7 @@ def pad(input, pad, mode='constant', value=0):
         >>> out = F.pad(t4d, p2d, "constant", 0)
         >>> print(out.data.size())
         torch.Size([3, 3, 8, 4])
-        >>> t4d = torch.Tensor(3, 3, 4, 2)
+        >>> t4d = torch.empty(3, 3, 4, 2)
         >>> p3d = (0, 1, 2, 1, 3, 3) # pad by (0, 1), (2, 1), and (3, 3)
         >>> out = F.pad(t4d, p3d, "constant", 0)
         >>> print(out.data.size())
@@ -2041,7 +2063,8 @@ def assert_int_or_pair(arg, arg_name, message):
 
 
 def unfold(input, kernel_size, dilation=1, padding=0, stride=1):
-    r"""
+    r"""Creates array of convolution patches from :math:`(N,C,H,W)`-tensor
+
     See :class:`torch.nn.Unfold` for details
     """
 
@@ -2059,7 +2082,8 @@ def unfold(input, kernel_size, dilation=1, padding=0, stride=1):
 
 
 def fold(input, output_size, kernel_size, dilation=1, padding=0, stride=1):
-    r"""
+    r"""Combines array of convolution patches to :math:`(N,C,H,W)`-tensor
+
     See :class:`torch.nn.Fold` for details
     """
     if input is not None and input.dim() == 3:

@@ -278,12 +278,20 @@ class RNN(RNNBase):
           Defaults to zero if not provided.
 
     Outputs: output, h_n
-        - **output** of shape `(seq_len, batch, hidden_size * num_directions)`: tensor
+        - **output** of shape `(seq_len, batch, num_directions * hidden_size)`: tensor
           containing the output features (`h_k`) from the last layer of the RNN,
           for each `k`.  If a :class:`torch.nn.utils.rnn.PackedSequence` has
           been given as the input, the output will also be a packed sequence.
+
+          For the unpacked case, the directions can be separated
+          using ``output.view(seq_len, batch, num_directions, hidden_size)``,
+          with forward and backward being direction `0` and `1` respectively.
+          Similarly, the directions can be separated in the packed case.
         - **h_n** (num_layers * num_directions, batch, hidden_size): tensor
           containing the hidden state for `k = seq_len`.
+
+          Like *output*, the layers can be separated using
+          ``h_n.view(num_layers, num_directions, batch, hidden_size)``.
 
     Attributes:
         weight_ih_l[k]: the learnable input-hidden weights of the k-th layer,
@@ -377,12 +385,20 @@ class LSTM(RNNBase):
 
 
     Outputs: output, (h_n, c_n)
-        - **output** of shape `(seq_len, batch, hidden_size * num_directions)`: tensor
+        - **output** of shape `(seq_len, batch, num_directions * hidden_size)`: tensor
           containing the output features `(h_t)` from the last layer of the LSTM,
           for each t. If a :class:`torch.nn.utils.rnn.PackedSequence` has been
           given as the input, the output will also be a packed sequence.
+
+          For the unpacked case, the directions can be separated
+          using ``output.view(seq_len, batch, num_directions, hidden_size)``,
+          with forward and backward being direction `0` and `1` respectively.
+          Similarly, the directions can be separated in the packed case.
         - **h_n** of shape `(num_layers * num_directions, batch, hidden_size)`: tensor
-          containing the hidden state for `t = seq_len`
+          containing the hidden state for `t = seq_len`.
+
+          Like *output*, the layers can be separated using
+          ``h_n.view(num_layers, num_directions, batch, hidden_size)`` and similarly for *c_n*.
         - **c_n** (num_layers * num_directions, batch, hidden_size): tensor
           containing the cell state for `t = seq_len`
 
@@ -402,7 +418,7 @@ class LSTM(RNNBase):
         >>> input = torch.randn(5, 3, 10)
         >>> h0 = torch.randn(2, 3, 20)
         >>> c0 = torch.randn(2, 3, 20)
-        >>> output, hn = rnn(input, (h0, c0))
+        >>> output, (hn, cn) = rnn(input, (h0, c0))
     """
 
     def __init__(self, *args, **kwargs):
@@ -457,12 +473,20 @@ class GRU(RNNBase):
           Defaults to zero if not provided.
 
     Outputs: output, h_n
-        - **output** of shape `(seq_len, batch, hidden_size * num_directions)`: tensor
+        - **output** of shape `(seq_len, batch, num_directions * hidden_size)`: tensor
           containing the output features h_t from the last layer of the GRU,
           for each t. If a :class:`torch.nn.utils.rnn.PackedSequence` has been
           given as the input, the output will also be a packed sequence.
+          For the unpacked case, the directions can be separated
+          using ``output.view(seq_len, batch, num_directions, hidden_size)``,
+          with forward and backward being direction `0` and `1` respectively.
+
+          Similarly, the directions can be separated in the packed case.
         - **h_n** of shape `(num_layers * num_directions, batch, hidden_size)`: tensor
           containing the hidden state for `t = seq_len`
+
+          Like *output*, the layers can be separated using
+          ``h_n.view(num_layers, num_directions, batch, hidden_size)``.
 
     Attributes:
         weight_ih_l[k] : the learnable input-hidden weights of the :math:`\text{k}^{th}` layer
@@ -533,6 +557,7 @@ class RNNCell(RNNCellBase):
         - **input** of shape `(batch, input_size)`: tensor containing input features
         - **hidden** of shape `(batch, hidden_size)`: tensor containing the initial hidden
           state for each element in the batch.
+          Defaults to zero if not provided.
 
     Outputs: h'
         - **h'** of shape `(batch, hidden_size)`: tensor containing the next hidden state
@@ -578,8 +603,10 @@ class RNNCell(RNNCellBase):
         for weight in self.parameters():
             weight.data.uniform_(-stdv, stdv)
 
-    def forward(self, input, hx):
+    def forward(self, input, hx=None):
         self.check_forward_input(input)
+        if hx is None:
+            hx = input.new_zeros(input.size(0), self.hidden_size, requires_grad=False)
         self.check_forward_hidden(input, hx)
         if self.nonlinearity == "tanh":
             func = self._backend.RNNTanhCell
@@ -604,7 +631,7 @@ class LSTMCell(RNNCellBase):
         \begin{array}{ll}
         i = \sigma(W_{ii} x + b_{ii} + W_{hi} h + b_{hi}) \\
         f = \sigma(W_{if} x + b_{if} + W_{hf} h + b_{hf}) \\
-        g = \tanh(W_{ig} x + b_{ig} + W_{hc} h + b_{hg}) \\
+        g = \tanh(W_{ig} x + b_{ig} + W_{hg} h + b_{hg}) \\
         o = \sigma(W_{io} x + b_{io} + W_{ho} h + b_{ho}) \\
         c' = f * c + i * g \\
         h' = o \tanh(c') \\
@@ -624,6 +651,8 @@ class LSTMCell(RNNCellBase):
           state for each element in the batch.
         - **c_0** of shape `(batch, hidden_size)`: tensor containing the initial cell state
           for each element in the batch.
+
+          If `(h_0, c_0)` is not provided, both **h_0** and **c_0** default to zero.
 
     Outputs: h_1, c_1
         - **h_1** of shape `(batch, hidden_size)`: tensor containing the next hidden state
@@ -671,8 +700,11 @@ class LSTMCell(RNNCellBase):
         for weight in self.parameters():
             weight.data.uniform_(-stdv, stdv)
 
-    def forward(self, input, hx):
+    def forward(self, input, hx=None):
         self.check_forward_input(input)
+        if hx is None:
+            hx = input.new_zeros(input.size(0), self.hidden_size, requires_grad=False)
+            hx = (hx, hx)
         self.check_forward_hidden(input, hx[0], '[0]')
         self.check_forward_hidden(input, hx[1], '[1]')
         return self._backend.LSTMCell(
@@ -706,6 +738,7 @@ class GRUCell(RNNCellBase):
         - **input** of shape `(batch, input_size)`: tensor containing input features
         - **hidden** of shape `(batch, hidden_size)`: tensor containing the initial hidden
           state for each element in the batch.
+          Defaults to zero if not provided.
 
     Outputs: h'
         - **h'** of shape `(batch, hidden_size)`: tensor containing the next hidden state
@@ -750,8 +783,10 @@ class GRUCell(RNNCellBase):
         for weight in self.parameters():
             weight.data.uniform_(-stdv, stdv)
 
-    def forward(self, input, hx):
+    def forward(self, input, hx=None):
         self.check_forward_input(input)
+        if hx is None:
+            hx = input.new_zeros(input.size(0), self.hidden_size, requires_grad=False)
         self.check_forward_hidden(input, hx)
         return self._backend.GRUCell(
             input, hx,

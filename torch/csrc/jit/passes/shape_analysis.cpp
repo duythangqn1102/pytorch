@@ -1,11 +1,17 @@
 #include "torch/csrc/jit/passes/shape_analysis.h"
+
 #include "torch/csrc/jit/ir.h"
 #include "torch/csrc/jit/argument_spec.h"
-#include "torch/csrc/jit/generated/aten_dispatch.h"
+#include "torch/csrc/jit/aten_dispatch.h"
 
+#include <ATen/DeviceGuard.h>
 #include <ATen/ExpandUtils.h>
 
+#include <exception>
 #include <iostream>
+#include <memory>
+#include <utility>
+#include <vector>
 
 namespace torch { namespace jit {
 
@@ -22,11 +28,12 @@ void setDynamicType(Node * node) {
 
 at::Tensor representativeTensor(const TensorType * type) {
   auto backend = type->device() == -1 ? at::kCPU : at::kCUDA;
+  at::DeviceGuard device_guard(type->device());
   auto & attype = at::getType(backend, type->scalarType());
   return attype.tensor(type->sizes(), type->strides()).zero_();
 }
 
-void PropagateShapeOnBlock(Block * block);
+void PropagateShapeOnBlock(Block * block, bool insert_expands=true);
 
 std::pair<std::vector<TensorType*>, bool> gatherTypes(at::ArrayRef<Value*> values) {
   std::vector<TensorType*> types;
@@ -44,17 +51,19 @@ bool mergeTypes(ArrayRef<Value*> lhs, ArrayRef<Value*> rhs, ArrayRef<Value*> out
   JIT_ASSERT(lhs.size() == rhs.size() && rhs.size() == outputs.size());
   bool changed = false;
   for(size_t i = 0; i < lhs.size(); ++i) {
+    auto old_output_type = outputs[i]->type();
     if(*lhs[i]->type() == *rhs[i]->type()) {
       outputs[i]->setType(lhs[i]->type());
     } else {
       outputs[i]->setType(DynamicType::get());
-      changed = true;
     }
+    if(*old_output_type != *outputs[i]->type())
+      changed = true;
   }
   return changed;
 }
 
-void PropagateShapeOnNode(Node * node);
+void PropagateShapeOnNode(Node * node, bool insert_expands=true);
 
 void broadcastPointwise(Node *node, std::vector<TensorType*>& types) {
   JIT_ASSERT(types.size() == 2);
@@ -66,6 +75,7 @@ void broadcastPointwise(Node *node, std::vector<TensorType*>& types) {
     auto graph = node->owningGraph();
     Node *expand = graph->create(aten::expand, {node->inputs().at(input_idx)})
                         ->is_(attr::size, expected_size)
+                        ->i_(attr::implicit, 0)
                         ->insertBefore(node);
     PropagateShapeOnNode(expand);
     node->replaceInput(input_idx, expand->output());
@@ -83,18 +93,20 @@ void PropagateShapeOnNodeByRunningIt(Node* node, const std::vector<TensorType*>&
   for(auto & type : types) {
     stack.push_back(representativeTensor(type));
   }
+
   // XXX: we're not catching any exceptions from the op for now. This
   // is to uncover any mistakes we could make when editing this code,
   // and eventually it shouldn't matter, because this phase should be
   // preceded by schema checking.
   op_info.op(stack);
+
   JIT_ASSERT(stack.size() == node->outputs().size());
   for(size_t i = 0; i < stack.size(); ++i) {
     node->outputs()[i]->inferTypeFrom(stack[i]);
   }
 }
 
-void PropagateShapeOnNode(Node * node) {
+void PropagateShapeOnNode(Node * node, bool insert_expands) {
   using AKind = AttributeKind;
   // These don't require the types and present flag. Return early after we
   // process them
@@ -120,8 +132,14 @@ void PropagateShapeOnNode(Node * node) {
       auto loop_carried_outputs = body_block->outputs().slice(1); // skip cond
 
       do {
-        PropagateShapeOnBlock(body_block);
+        PropagateShapeOnBlock(body_block, /*insert_expands=*/false);
+        // note: inserting expands is unsafe at this point, we don't know
+        // if the types are stable yet, so the arguments to expand may change
       } while(mergeTypes(loop_carried_block, loop_carried_outputs, loop_carried_block));
+
+      // now that the types are stable, we can insert the expands
+      PropagateShapeOnBlock(body_block, /*insert_expands=*/true);
+
 
       for(size_t i = 0; i < loop_carried_inputs.size(); ++i) {
         node->outputs()[i]->setType(loop_carried_block[i]->type());
@@ -130,7 +148,6 @@ void PropagateShapeOnNode(Node * node) {
     }
     default: ; // fall-through
   }
-
   std::vector<TensorType*> types;
   bool present;
   std::tie(types, present) = gatherTypes(node->inputs());
@@ -142,7 +159,7 @@ void PropagateShapeOnNode(Node * node) {
   // XXX: real attributes of node can be a superset of attrs
   // XXX: if this returns true then you are obliged to set the types
   auto check_overload = [&](size_t num_inputs, size_t num_outputs,
-                            std::vector<std::pair<AttributeKind,Symbol>> attrs = {}) -> bool {
+                            std::vector<std::pair<AttributeKind,Symbol>> attrs) {
     JIT_ASSERT(!handled);
     if (node->inputs().size() != num_inputs) return false;
     if (node->outputs().size() != num_outputs) return false;
@@ -171,18 +188,18 @@ void PropagateShapeOnNode(Node * node) {
     case aten::ge:
     case aten::eq:
     case aten::ne: {
-      if (node->inputs().size() == 2) {
+      if (node->inputs().size() == 2 && insert_expands) {
         broadcastPointwise(node, types);
       }
       // NB: we don't handle the nodes in any other way, because the type casting
       // logic in scalar cases is non-trivial. It's better to just run them.
     } break;
     case aten::neg: {
-      if (!check_overload(/*num_inputs=*/1, /*num_outputs=*/1)) break;
+      if (!check_overload(/*num_inputs=*/1, /*num_outputs=*/1, {})) break;
       node->output()->setType(types.at(0)->contiguous());
     } break;
     case aten::mm: {
-      if (!check_overload(/*num_inputs=*/2, /*num_outputs=*/1)) break;
+      if (!check_overload(/*num_inputs=*/2, /*num_outputs=*/1, {})) break;
       auto lhs_type = types.at(0);
       auto rhs_type = types.at(1);
       SHAPE_ASSERT(lhs_type->sizes().size() == 2 && rhs_type->sizes().size() == 2);
@@ -191,7 +208,7 @@ void PropagateShapeOnNode(Node * node) {
         at::IntList{lhs_type->sizes().at(0), rhs_type->sizes().at(1)}));
     } break;
     case aten::t: {
-      if (!check_overload(/*num_inputs=*/1, /*num_outputs=*/1)) break;
+      if (!check_overload(/*num_inputs=*/1, /*num_outputs=*/1, {})) break;
       auto tp = types.at(0);
       auto sizes = tp->sizes();
       auto strides = tp->strides();
@@ -215,11 +232,11 @@ void PropagateShapeOnNode(Node * node) {
     } break;
     case aten::sum: {
       if (check_overload(/*num_inputs=*/1, /*num_outputs=*/1,
-                         {{AKind::i, attr::dim},
+                         {{AKind::is, attr::dim},
                           {AKind::i, attr::keepdim}})) {
         auto tp = types.at(0);
         auto sizes = tp->sizes();
-        int64_t dim = node->i(attr::dim);
+        int64_t dim = node->is(attr::dim).at(0);
         SHAPE_ASSERT(dim >= 0 && static_cast<size_t>(dim) < sizes.size());
         if (node->i(attr::keepdim)) {
           sizes.at(dim) = 1;
@@ -227,7 +244,7 @@ void PropagateShapeOnNode(Node * node) {
           sizes.erase(sizes.begin() + dim);
         }
         node->output()->setType(tp->withSizes(sizes));
-      } else if (check_overload(/*num_inputs=*/1, /*num_outputs=*/1)) {
+      } else if (check_overload(/*num_inputs=*/1, /*num_outputs=*/1, {})) {
         node->output()->setType(types.at(0)->withSizes({}));
       }
     } break;
@@ -292,6 +309,19 @@ void PropagateShapeOnNode(Node * node) {
         PropagateShapeOnNodeByRunningIt(node, types);
       }
     } break;
+    case aten::index_select: {
+      if(check_overload(/*num_inputs=*/2, /*num_outputs=*/1,
+                        {{AKind::i, attr::dim}})) {
+        auto ten = types.at(0);
+        auto index = types.at(1);
+        int64_t dim = node->i(attr::dim);
+        SHAPE_ASSERT(index->sizes().size() == 1);
+        SHAPE_ASSERT(dim >= 0 && static_cast<size_t>(dim) < ten->sizes().size());
+        std::vector<int64_t> sizes = ten->sizes();
+        sizes[dim] = index->sizes()[0];
+        node->output()->setType(ten->withSizes(sizes));
+      }
+    } break;
     case prim::ReplaceIfUndef: {
       // If types[0] has a type, then it is not defined, and the type will
       // get set to types[0] because that will be the value propagated.
@@ -316,6 +346,18 @@ void PropagateShapeOnNode(Node * node) {
       setDynamicType(node);
       handled = true;
     } break;
+    case onnx::Shape: {
+      if (check_overload(/*num_inputs=*/1, /*num_outputs=*/1, {})) {
+        std::vector<int64_t> dim_vec = {(int64_t)types.at(0)->sizes().size()};
+        at::IntList dims(dim_vec);
+        node->output()->setType(
+            std::make_shared<TensorType>(at::kLong, -1, dims));
+      }
+    } break;
+    case onnx::Reshape: {
+      setDynamicType(node);
+      handled = true;
+    }
     default: {
     } break;
   }
@@ -330,18 +372,18 @@ void PropagateShapeOnNode(Node * node) {
     bool shape_inferenceable = !std::any_of(types.begin(), types.end(), [](TensorType* t){
       return at::isIntegralType(t->scalarType());
     });
-    if (!shape_inferenceable) {
-      setDynamicType(node);
-    } else {
+    if (node->kind() == aten::type_as || shape_inferenceable ) {
       PropagateShapeOnNodeByRunningIt(node, types);
+    } else {
+      setDynamicType(node);
     }
   }
 }
 
-void PropagateShapeOnBlock(Block * block) {
+void PropagateShapeOnBlock(Block * block, bool insert_expands) {
   for (Node * node : block->nodes()) {
     try {
-      PropagateShapeOnNode(node);
+      PropagateShapeOnNode(node, insert_expands);
     } catch(propagation_error& e) {
       setDynamicType(node);
     } catch(std::exception & e) {
