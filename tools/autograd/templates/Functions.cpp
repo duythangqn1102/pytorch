@@ -1,21 +1,29 @@
-#include "Functions.h"
-#include <ATen/WrapDimUtils.h>
-#include <ATen/WrapDimUtilsMulti.h>
-
-// define constants like M_PI and C keywords for MSVC
+// NB: Must be at the top of file to avoid including the deprecated "math.h".
+// https://stackoverflow.com/questions/6563810/m-pi-works-with-math-h-but-not-with-cmath-in-visual-studio
 #ifdef _MSC_VER
 #define _USE_MATH_DEFINES
-#include <ciso646>
+#include <cmath>
 #endif
-#include <math.h>
+
+#include "Functions.h"
+#include <ATen/Utils.h>
+#include <c10/core/TensorOptions.h>
+#include <ATen/WrapDimUtils.h>
+#include <ATen/WrapDimUtilsMulti.h>
+#include <ATen/SparseTensorUtils.h>
+#include <ATen/ExpandUtils.h>
+#include <ATen/core/Reduction.h>
+
+#include <ciso646>
 #include <algorithm>
 #include <numeric>
+#include <functional>
 
 // ${generated_comment}
 
 using at::Tensor;
 using at::Scalar;
-using at::IntList;
+using at::IntArrayRef;
 using at::TensorList;
 
 namespace torch { namespace autograd { namespace generated {
@@ -57,7 +65,7 @@ Tensor maybe_multiply(const Tensor & t, const Scalar & s) {
   bool is_one = false;
   if (s.isFloatingPoint()) {
     is_one = s.toDouble() == 1;
-  } else if(s.isIntegral()) {
+  } else if(s.isIntegral(true)) {
     is_one = s.toLong() == 1;
   }
 
@@ -68,28 +76,35 @@ Tensor maybe_multiply(const Tensor & t, const Scalar & s) {
   }
 }
 
-int64_t _safe_size(IntList sizes, int64_t dim) {
-  dim = at::maybe_wrap_dim(dim, sizes.size());
-  return sizes.size() != 0 ? sizes[dim] : 1;
+int64_t _safe_size(IntArrayRef sizes, IntArrayRef dim) {
+  int64_t size = 1;
+  if (sizes.size() == 0) {
+    return 1;
+  }
+  for (auto d : dim) {
+    d = at::maybe_wrap_dim(d, sizes.size());
+    size *= sizes[d];
+  }
+  return size;
 }
 
-Tensor norm_backward(const Tensor & grad, const Tensor & self, const Scalar & p_, const Tensor & norm) {
-  double p = p_.toDouble();
+Tensor norm_backward(const Tensor & grad, const Tensor & self, const optional<Scalar> & p_, const Tensor & norm) {
+  double p = p_.value_or(2.0).toDouble();
   Tensor self_scaled;
   Tensor scale_v;
   if (p == 0.0) {
     return zeros_like(self);
   } else if (p == 1.0) {
     return self.sign() * grad;
-  } else if (p < 2.0) {
-    self_scaled = self.sign() * self.abs().pow(p - 1);
-    scale_v = grad / norm.pow(p - 1);
   } else if (p == 2.0) {
     self_scaled = self;
     scale_v = grad / norm;
-  } else if (p == INFINITY) {
-    self_scaled = self.sign() * (self.abs() == norm).toType(self.type());
+  } else if (std::isinf(p)) {
+    self_scaled = self.sign() * (self.abs() == norm).type_as(self);
     scale_v = grad.clone();
+  } else if (p < 2.0) {
+    self_scaled = self.sign() * self.abs().pow(p - 1);
+    scale_v = grad / norm.pow(p - 1);
   } else {
     self_scaled = self * self.abs().pow(p - 2);
     scale_v = grad / norm.pow(p - 1);
@@ -99,31 +114,53 @@ Tensor norm_backward(const Tensor & grad, const Tensor & self, const Scalar & p_
   return self_scaled * scale_v;
 }
 
-Tensor norm_backward(Tensor grad, const Tensor & self, const Scalar & p_, Tensor norm, int64_t dim, bool keepdim) {
+Tensor norm_backward(Tensor grad, const Tensor & self, const optional<Scalar> & p_, Tensor norm, IntArrayRef dim, bool keepdim) {
+  IntArrayRef sizes = self.sizes();
   if (!keepdim && self.dim() != 0) {
-    grad = grad.unsqueeze(dim);
-    norm = norm.unsqueeze(dim);
+    if (dim.size()==1) {
+      grad = grad.unsqueeze(dim[0]);
+      norm = norm.unsqueeze(dim[0]);
+    } else {
+      auto dims_to_unsqueeze = at::dim_list_to_bitset(dim, sizes.size());
+      for (size_t i = 0; i < sizes.size(); i++){
+        if (dims_to_unsqueeze[i]) {
+          grad = grad.unsqueeze(i);
+          norm = norm.unsqueeze(i);
+        }
+      }
+    }
   }
   return norm_backward(grad, self, p_, norm);
 }
 
-Tensor reduce_to(const Tensor & grad, IntList sizes) {
-  if (sizes.size() == 0) {
-    return grad.sum();
+Tensor pow_backward(Tensor grad, const Tensor & self, const Scalar & exponent_) {
+  double exponent = exponent_.toDouble();
+  if (exponent == 0.0) {
+    return zeros_like(self);
+  } else {
+    return grad * exponent * self.pow(exponent - 1);
   }
-  Tensor result = grad;
-  while (result.dim() > (int64_t)sizes.size()) {
-    result = result.sum(0, false);
-  }
-  for (int64_t i = 0; i < result.dim(); ++i) {
-    if (sizes[i] == 1 && result.sizes()[i] > 1) {
-      result = result.sum(i, true);
-    }
-  }
-  return result;
 }
 
-Tensor permute_backwards(const Tensor & grad, IntList fwd_dims) {
+Tensor pow_backward_self(Tensor grad, const Tensor & self, const Tensor & exponent) {
+  return at::where(exponent == 0.0, at::zeros({}, grad.options()), grad * exponent * self.pow(exponent - 1));
+}
+
+Tensor pow_backward_exponent(Tensor grad, const Tensor & self, const Tensor & exponent) {
+  return grad * self.pow(exponent) * self.log();
+}
+
+Tensor pow_backward_exponent(Tensor grad, const Scalar & base, const Tensor & exponent) {
+  return grad * at::pow(base, exponent) * std::log(base.toDouble());
+}
+
+Tensor mvlgamma_backward(Tensor grad, const Tensor & self, int64_t p) {
+  Tensor args = at::arange(-p / 2. + 0.5, 0.5, 0.5, self.options());
+  args = args.add(self.unsqueeze(-1));
+  return grad * args.digamma_().sum(-1);
+}
+
+Tensor permute_backwards(const Tensor & grad, IntArrayRef fwd_dims) {
   // invert the permutation
   auto ndims = fwd_dims.size();
   std::vector<int64_t> dims(ndims);
@@ -133,17 +170,23 @@ Tensor permute_backwards(const Tensor & grad, IntList fwd_dims) {
   return grad.permute(dims);
 }
 
-Tensor sum_backward(const Tensor & grad, IntList sizes, IntList dims, bool keepdim) {
+Tensor unsqueeze_multiple(const Tensor & t, IntArrayRef dim, size_t n_dims) {
+    auto dims_to_unsqueeze = at::dim_list_to_bitset(dim, n_dims);
+    Tensor res = t;
+    for (size_t i = 0; i < n_dims; i++){
+      if (dims_to_unsqueeze[i]) {
+        res = res.unsqueeze(i);
+      }
+    }
+    return res;
+}
+
+Tensor sum_backward(const Tensor & grad, IntArrayRef sizes, IntArrayRef dims, bool keepdim) {
   if (!keepdim && sizes.size() > 0) {
     if (dims.size()==1) {
       return grad.unsqueeze(dims[0]).expand(sizes);
     } else {
-      auto dims_to_unsqueeze = dim_list_to_bitset(dims, sizes.size());
-      Tensor res = grad;
-      for (size_t i = 0; i < sizes.size(); i++){
-	if (dims_to_unsqueeze[i])
-	  res = res.unsqueeze(i);
-      }
+      Tensor res = unsqueeze_multiple(grad, dims, sizes.size());
       return res.expand(sizes);
     }
   } else {
@@ -151,8 +194,17 @@ Tensor sum_backward(const Tensor & grad, IntList sizes, IntList dims, bool keepd
   }
 }
 
+std::vector<int64_t> reverse_list(const IntArrayRef list) {
+  auto result = std::vector<int64_t>();
+  result.reserve(list.size());
+  for (auto iter = list.rbegin(); iter != list.rend(); iter++) {
+    result.push_back(*iter);
+  }
+  return result;
+}
+
 Tensor reverse_dim(const Tensor& t, int64_t dim) {
-  Tensor index = at::arange(t.size(dim) - 1, -1, -1, t.type().toScalarType(at::ScalarType::Long));
+  Tensor index = at::arange(t.size(dim) - 1, -1, -1, t.options().dtype(at::kLong));
   return t.index_select(dim, index);
 }
 
@@ -161,9 +213,9 @@ Tensor prod_safe_zeros_backward(const Tensor &grad, const Tensor& inp, int64_t d
     return grad;
   }
 
-  std::vector<int64_t> ones_size(inp.sizes());
+  auto ones_size = inp.sizes().vec();
   ones_size[dim] = 1;
-  Tensor ones = at::ones(ones_size, grad.type());
+  Tensor ones = at::ones(ones_size, grad.options());
   Tensor exclusive_normal_nocp = at::cat({ones, inp.narrow(dim, 0, inp.size(dim) - 1)}, dim);
   Tensor exclusive_normal = exclusive_normal_nocp.cumprod(dim);
 
@@ -207,7 +259,7 @@ Tensor prod_backward(Tensor grad, const Tensor& input, Tensor result, int64_t di
 
   Tensor zero_mask = (input == 0);
   Tensor slice_zero_count = zero_mask.sum(dim, true);
-  int64_t total_zeros = slice_zero_count.sum().toCLong();
+  int64_t total_zeros = slice_zero_count.sum().item<int64_t>();
   if (total_zeros == 0) {
     return (grad * result) / input;
   } else {
@@ -309,15 +361,15 @@ Tensor cumprod_backward(const Tensor &grad, const Tensor &input, int64_t dim) {
   }
 
   // Simple case with nonzero elements in the input
-  if ((input != 0).all().toCByte()) {
+  if ((input != 0).all().item<uint8_t>()) {
     Tensor result = at::cumprod(input, dim);
     return sum_scan_exclusive(result * grad, dim) / input;
   }
 
-  std::vector<int64_t> ones_size(input.sizes());
+  auto ones_size = input.sizes().vec();
   ones_size[dim] = 1;
-  Tensor ones = at::ones({1}, grad.type()).expand(ones_size);
-  Tensor grad_input = at::zeros(input.sizes(), grad.type());
+  Tensor ones = at::ones({1}, grad.options()).expand(ones_size);
+  Tensor grad_input = at::zeros(input.sizes(), grad.options());
   Tensor prods_from_k_plus_1;
   Tensor omitted_products;
   for (int k = 0; k < dim_size; ++k) {
@@ -337,7 +389,7 @@ Tensor cumprod_backward(const Tensor &grad, const Tensor &input, int64_t dim) {
     // At this point omitted_products is the same size
     // as input, except on the dimension dim where it's
     // dim_size - k
-    TORCH_ASSERT(omitted_products.size(dim) == dim_size - k);
+    AT_ASSERT(omitted_products.size(dim) == dim_size - k);
 
     grad_input.select(dim, k).copy_(
         at::sum(grad.slice(dim, k) * omitted_products,dim));
@@ -346,12 +398,16 @@ Tensor cumprod_backward(const Tensor &grad, const Tensor &input, int64_t dim) {
   return grad_input;
 }
 
-Tensor gesv_backward_self(const Tensor & grad, const Tensor & self, const Tensor & A) {
-  return std::get<0>(at::gesv(grad, A.transpose(-2, -1)));
+Tensor cumprod_backward(const Tensor &grad, const Tensor &input, int64_t dim, optional<ScalarType> dtype) {
+  return cumprod_backward(grad.to(input.scalar_type()), input, dim);
 }
 
-Tensor gesv_backward_A(const Tensor & grad, const Tensor & self, const Tensor & A, const Tensor & solution) {
-  Tensor grad_self = gesv_backward_self(grad, self, A);
+Tensor solve_backward_self(const Tensor & grad, const Tensor & self, const Tensor & A) {
+  return std::get<0>(at::solve(grad, A.transpose(-2, -1)));
+}
+
+Tensor solve_backward_A(const Tensor & grad, const Tensor & self, const Tensor & A, const Tensor & solution) {
+  Tensor grad_self = solve_backward_self(grad, self, A);
   if (self.ndimension() == 2 && A.ndimension() == 2) {
     return -at::mm(grad_self, solution.transpose(-2, -1));
   }
@@ -369,15 +425,32 @@ Tensor cumsum_backward(const Tensor & x, int64_t dim) {
   return ret;
 }
 
-Tensor logsumexp_backward(Tensor grad, const Tensor & self, Tensor result, int64_t dim, bool keepdim) {
-  if (! keepdim) {
-    grad = grad.unsqueeze(dim);
-    result = result.unsqueeze(dim);
+Tensor logsumexp_backward(Tensor grad, const Tensor & self, Tensor result, IntArrayRef dim, bool keepdim) {
+  if (!keepdim && self.dim() != 0) {
+    grad = unsqueeze_multiple(grad, dim, self.sizes().size());
+    result = unsqueeze_multiple(result, dim, self.sizes().size());
   }
   return grad * (self - result).exp();
 }
 
-Tensor unsqueeze_to(const Tensor & self, IntList sizes) {
+Tensor unbind_backward(const variable_list& grads, int64_t dim) {
+  IntArrayRef sizes;
+  at::TensorOptions o;
+  for (auto v : grads) {
+    if (v.defined()) {
+      sizes = v.sizes();
+      o = static_cast<Tensor>(v).options();
+      break;
+    }
+  }
+  auto grads_tensors = fmap(grads, [&](const Variable& v) {
+    return (
+        v.defined() ? static_cast<Tensor>(v) : at::zeros({}, o).expand(sizes));
+  });
+  return at::stack(grads_tensors, dim);
+}
+
+Tensor unsqueeze_to(const Tensor & self, IntArrayRef sizes) {
   auto result = self;
 
   int64_t nDims = sizes.size();
@@ -389,7 +462,7 @@ Tensor unsqueeze_to(const Tensor & self, IntList sizes) {
   return result;
 }
 
-Tensor unsqueeze_to(const Tensor & self, int64_t dim, IntList sizes) {
+Tensor unsqueeze_to(const Tensor & self, int64_t dim, IntArrayRef sizes) {
   dim = at::maybe_wrap_dim(dim, sizes.size());
   // in NumPy it's not an error to unsqueeze a scalar, but we still need to avoided
   // unsqueezing in the backward.
@@ -407,7 +480,7 @@ std::vector<Tensor> cat_tensors_backward(const Tensor & grad, const std::vector<
     auto& shape = sizes[i];
     // If input was empty tensor, gradInput should be empty tensor.
     if (shape == std::vector<int64_t>({0})) {
-      grad_inputs[i] = at::zeros({0}, grad.type());
+      grad_inputs[i] = at::zeros({0}, grad.options());
       continue;
     }
     auto size = shape[dim];
@@ -417,8 +490,26 @@ std::vector<Tensor> cat_tensors_backward(const Tensor & grad, const std::vector<
   return grad_inputs;
 }
 
-Tensor mm_mat1_backward(const Tensor & grad, const Tensor & mat2, IntList sizes, IntList strides, const Scalar & alpha) {
+Tensor clamp_backward(const Tensor & grad, const Tensor &self, const optional<Scalar> & min, const optional<Scalar> & max) {
+  // clamp: gradients not defined on min and max, so we return the subgradient 1 for these cases.
+  if (max && min) {
+    return grad * ((self >= *min) * (self <= *max)).type_as(grad);
+  } else if (min) {
+    return grad * (self >= *min).type_as(grad);
+  } else if (max) {
+    return grad * (self <= *max).type_as(grad);
+  } else {
+    return grad;
+  }
+}
+
+Tensor mm_mat1_backward(const Tensor & grad, const Tensor & mat2, const Tensor & mat1, const Scalar & alpha) {
   // if input was column-major, return grad as column-order for efficiency
+  if (mat1.is_sparse()) {
+    throw std::runtime_error("calculating the gradient of a sparse Tensor argument to mm is not supported.");
+  }
+  at::IntArrayRef sizes = mat1.sizes();
+  at::IntArrayRef strides = mat1.strides();
   if (strides[0] == 1 && strides[1] == sizes[0]) {
     return maybe_multiply(mat2.mm(grad.t()).t(), alpha);
   } else {
@@ -426,17 +517,35 @@ Tensor mm_mat1_backward(const Tensor & grad, const Tensor & mat2, IntList sizes,
   }
 }
 
-Tensor mm_mat2_backward(const Tensor & grad, const Tensor & mat1, IntList sizes, IntList strides, const Scalar & alpha) {
+Tensor mm_mat2_backward(const Tensor & grad, const Tensor & mat1, IntArrayRef sizes, IntArrayRef strides, const Scalar & alpha) {
   // if input was column-major, return grad as column-order for efficiency
   if (strides[0] == 1 && strides[1] == sizes[0]) {
+    if (mat1.is_sparse()) {
+      // Since mm(dense, sparse) doesn't exist,
+      // pass a transposed output matrix to the underlying "addmm"
+      // function directly.
+      int64_t out_rows = mat1.size(1);
+      int64_t out_cols = grad.size(1);
+      Tensor t = at::zeros({}, grad.options()).expand({out_rows, out_cols}, true);
+      Tensor r = at::empty({out_cols, out_rows}, grad.options()).t();
+      at::addmm_out(r, t, mat1.t(), grad, alpha, 1);
+      return r;
+    }
     return maybe_multiply(grad.t().mm(mat1).t(), alpha);
   } else {
     return maybe_multiply(mat1.t().mm(grad), alpha);
   }
 }
 
+Tensor _sparse_addmm_sparse_backward(const Tensor& grad, const Tensor& sparse_, const Tensor& dense, const Scalar& alpha) {
+  AT_ASSERT(sparse_.is_sparse());
+  auto sparse = sparse_.coalesce();
+  Tensor grad_sparse = maybe_multiply(grad.mm(dense.t()), alpha);
+  return grad_sparse.sparse_mask(sparse);
+}
+
 Tensor renorm_backward(const Tensor & grad, const Tensor & self, Scalar p, int64_t dim, Scalar maxnorm) {
-  auto transposed_sizes = std::vector<int64_t>(self.transpose(dim, 0).sizes());
+  auto transposed_sizes = self.transpose(dim, 0).sizes().vec();
   auto flatten = [&](const Tensor & t) {
     return t.transpose(dim, 0).contiguous().view({t.size(dim), -1});
   };
@@ -472,7 +581,7 @@ Tensor sum_tensorlist(TensorList tl) {
   return sum;
 }
 
-Tensor repeat_backward(Tensor grad, int64_t input_dims, IntList repeats) {
+Tensor repeat_backward(Tensor grad, int64_t input_dims, IntArrayRef repeats) {
   int64_t num_unsqueezed = grad.dim() - input_dims;
   for (int64_t i = 0; i < num_unsqueezed; ++i) {
     grad = grad.sum(0, false);
@@ -488,44 +597,63 @@ Tensor repeat_backward(Tensor grad, int64_t input_dims, IntList repeats) {
   return grad;
 }
 
-Tensor select_backward_scalar(Tensor grad, const Tensor & input, const Tensor & value) {
+// p1m == 1 - p
+Tensor _fused_dropout_backward(Tensor grad, Tensor mask, double p1m) {
+  if (grad.requires_grad()) {
+    // Use autograd-friendly backward if double backward is required
+    return grad * (mask.type_as(grad) * (1. / p1m));
+  } else {
+    return at::_masked_scale(grad, mask, 1. / p1m);
+  }
+}
+
+Tensor select_equals_backward(Tensor grad, const Tensor & input, const Tensor & value) {
   auto grad_input = zeros_like(input);
   grad_input.masked_fill_(input == value, grad);
   return grad_input;
 }
 
-Tensor select_backward(Tensor grad, int64_t dim, Tensor indices, IntList sizes, bool keepdim) {
-  if (!keepdim) {
+Tensor index_select_backward(Tensor grad, int64_t dim, Tensor indices, IntArrayRef sizes, bool keepdim) {
+  if (!keepdim && sizes.size() > 0) {
     grad = grad.unsqueeze(dim);
     indices = indices.unsqueeze(dim);
   }
-  return at::zeros(sizes, grad.type()).scatter_(dim, indices, grad);
+  return at::zeros(sizes, grad.options()).scatter_(dim, indices, grad);
 }
 
-Tensor trace_backward(const Tensor & grad, IntList sizes) {
+Tensor slice_backward(Tensor grad, IntArrayRef input_sizes, int64_t dim, int64_t start, int64_t end, int64_t step) {
+  auto grad_input = at::zeros(input_sizes, grad.options());
+  grad_input.slice(dim, start, end, step).copy_(grad);
+  return grad_input;
+}
+
+Tensor select_backward(Tensor grad, IntArrayRef input_sizes, int64_t dim, int64_t index) {
+  auto grad_input = at::zeros(input_sizes, grad.options());
+  grad_input.select(dim, index).copy_(grad);
+  return grad_input;
+}
+
+Tensor trace_backward(const Tensor & grad, IntArrayRef sizes) {
   if (sizes.size() != 2) {
     throw std::runtime_error("expected matrix input");
   }
 
-  auto& long_type = grad.type().toScalarType(at::kLong);
-
-  auto grad_input = at::zeros(sizes[0] * sizes[1], grad.type());
-  auto indices = at::arange(0, grad_input.numel(), sizes[1] + 1, long_type);
+  auto grad_input = at::zeros(sizes[0] * sizes[1], grad.options());
+  auto indices = at::arange(0, grad_input.numel(), sizes[1] + 1, grad.options().dtype(at::kLong));
   grad_input.index_fill_(0, indices, grad);
   return grad_input.view(sizes);
 }
 
-Tensor unfold_backward(const Tensor & grad, IntList input_sizes, int64_t dim, int64_t size, int64_t step) {
-  auto& long_type = grad.type().toScalarType(at::kLong);
+Tensor unfold_backward(const Tensor & grad, IntArrayRef input_sizes, int64_t dim, int64_t size, int64_t step) {
 
   int64_t numel = 1;
   for (auto size : input_sizes) {
     numel *= size;
   }
 
-  auto idx = at::arange(0, numel, long_type).view(input_sizes);
+  auto idx = at::arange(0, numel, grad.options().dtype(at::kLong)).view(input_sizes);
   auto idx_unfolded = idx.unfold(dim, size, step).contiguous().view(-1);
-  auto grad_input = at::zeros({numel}, grad.type());
+  auto grad_input = at::zeros({numel}, grad.options());
   grad_input.index_add_(0, idx_unfolded, grad.contiguous().view(-1));
   return grad_input.view(input_sizes);
 }
@@ -534,17 +662,57 @@ Tensor var_backward(const Tensor & grad, const Tensor & self, bool unbiased) {
   return (2.0 / (self.numel() - unbiased)) * grad * (self - self.mean());
 }
 
-Tensor var_backward(Tensor grad, const Tensor & self, int64_t dim, bool unbiased, bool keepdim) {
+Tensor var_backward(Tensor grad, const Tensor & self, IntArrayRef dim, bool unbiased, bool keepdim) {
   if (self.dim() == 0) {
     return var_backward(grad, self, unbiased);
   }
   if (!keepdim && self.dim() > 1) {
-    grad = grad.unsqueeze(dim);
+    grad = unsqueeze_multiple(grad, dim, self.sizes().size());
   }
-  return (2.0 / (self.size(dim) - unbiased)) * grad * (self - self.mean(dim, true));
+  return (2.0 / (_safe_size(self.sizes(), dim) - unbiased)) * grad * (self - self.mean(dim, true));
 }
 
-Tensor masked_scatter_backward(const Tensor & grad, const Tensor & mask, IntList sizes) {
+Tensor std_backward(const Tensor & result, const Tensor & grad, const Tensor & self, bool unbiased) {
+  return var_backward(grad / (result * 2), self, unbiased);
+}
+
+Tensor std_backward(const Tensor & result, Tensor grad, const Tensor & self, IntArrayRef dim, bool unbiased, bool keepdim) {
+  return var_backward(grad / (result * 2), self, dim, unbiased, keepdim);
+}
+
+Tensor mean_backward(Tensor grad, const IntArrayRef sizes, IntArrayRef dim, bool keepdim) {
+  return sum_backward(grad, sizes, dim, keepdim) / _safe_size(sizes, dim);
+}
+
+Tensor mean_backward(Tensor grad, const IntArrayRef sizes, int numel) {
+  return grad.expand(sizes) / numel;
+}
+
+Tensor var_std_mean_backward(const variable_list& grads, const Tensor & self, const Tensor & r1, const Tensor & r2, IntArrayRef dim, bool unbiased, bool keepdim, bool is_std) {
+  Tensor grad;
+  if (grads[0].defined()) {
+    grad = is_std ? std_backward(r1, grads[0], self, dim, unbiased, keepdim) : var_backward(grads[0], self, dim, unbiased, keepdim);
+  }
+  if (grads[1].defined()) {
+    Tensor mean_grad = mean_backward(grads[1], self.sizes(), dim, keepdim);
+    grad = grads[0].defined() ? grad + mean_grad : mean_grad;
+  }
+  return grad;
+}
+
+Tensor var_std_mean_backward(const variable_list& grads, const Tensor & self, const Tensor & r1, const Tensor & r2, bool unbiased, bool is_std) {
+  Tensor grad;
+  if (grads[0].defined()) {
+    grad = is_std ? std_backward(r1, grads[0], self, unbiased) : var_backward(grads[0], self, unbiased);
+  }
+  if (grads[1].defined()) {
+    Tensor mean_grad = mean_backward(grads[1], self.sizes(), self.numel());
+    grad = grads[0].defined() ? grad + mean_grad : mean_grad;
+  }
+  return grad;
+}
+
+Tensor masked_scatter_backward(const Tensor & grad, const Tensor & mask, IntArrayRef sizes) {
   int64_t numel = 1;
   for (auto size : sizes) {
     numel *= size;
@@ -554,42 +722,53 @@ Tensor masked_scatter_backward(const Tensor & grad, const Tensor & mask, IntList
   if (diff_nelem > 0) {
     // because mask_selected returns a 1-d tensor with size of masked elements that are 1,
     // we need to fill out the rest with zeros then reshape back to tensor2's size.
-    auto zeros_fillin = at::zeros({diff_nelem}, grad.type());
+    auto zeros_fillin = at::zeros({diff_nelem}, grad.options());
     mask_selected = at::cat({mask_selected, zeros_fillin}, 0);
   }
   return mask_selected.view(sizes);
 }
 
-Tensor potrf_backward(Tensor grad, bool upper, Tensor L) {
+Tensor cholesky_backward(Tensor grad, bool upper, Tensor L) {
   // cf. Iain Murray (2016); arXiv 1602.07527
+  // This gradient is symmetric, and not triangular.
+  // Cholesky additionally assumes that the input is symmetric, which is a subspace of
+  // R^{n x n}, and hence the derivative is not well-defined for off-diagonal
+  // elements. We resolve this by taking the gradient of the functionally independent
+  // elements of the matrix (i.e., the lower triangular portion of the input) and then
+  // reflect it on the upper triangular portion, thereby symmetrizing the gradient of
+  // the cholesky operation. The motivation behind this choice is that symmetric gradient
+  // leads to stable gradient updates, and retains symmetry of the updated matrix if it
+  // were updated by a gradient based algorithm.
   if (upper) {
-    L = L.t();
-    grad = grad.t();
+    L = L.transpose(-1, -2);
+    grad = grad.transpose(-1, -2);
   }
+  auto L_inverse = std::get<0>(at::triangular_solve(at::eye(L.size(-1), L.options()), L, /*upper=*/false));
+  auto phi = at::matmul(L.transpose(-1, -2), grad);
+  phi.tril_().diagonal(/*offset=*/0, /*dim1=*/-2, /*dim2=*/-1).mul_(0.5);
 
-  auto phi = [](const Tensor & A) -> Tensor {
-    auto B = A.tril();
-    B = B - 0.5 * at::diag(at::diag(B));
-    return B;
-  };
+  auto grad_input = at::matmul(at::matmul(L_inverse.transpose(-1, -2), phi), L_inverse);
+  return grad_input.add(grad_input.transpose(-1, -2)).mul_(0.5);  // Symmetrizing the gradient
+}
 
-  // make sure not to double-count variation, since
-  // only half of output matrix is unique
-  auto Lbar = grad.tril();
-
-  auto P = phi(at::mm(L.t(), Lbar));
-  Tensor S;
-  std::tie(S, std::ignore) = at::gesv(P + P.t(), L.t());
-  std::tie(S, std::ignore) = at::gesv(S.t(), L.t());
-  S = phi(S);
-  if (upper) {
-    S = S.t();
+Tensor cholesky_inverse_backward(Tensor grad, Tensor L, bool upper, Tensor inverse) {
+  Tensor grad_L;
+  if (grad.defined()) {
+    Tensor common_term = grad + grad.transpose(-2, -1);
+    common_term = at::matmul(inverse, at::matmul(common_term, inverse));
+    if (upper) {
+      grad_L = -at::matmul(L, common_term);
+    } else {
+      grad_L = -at::matmul(common_term, L);
+    }
+  } else {
+    grad_L = at::zeros({1}, L.options()).expand_as(L);
   }
-  return S;
+  return grad_L;
 }
 
 Tensor split_with_sizes_backward(const std::vector<torch::autograd::Variable> &grads,
-                                 IntList split_sizes, int64_t dim, IntList sizes, const Type &type) {
+                                 IntArrayRef split_sizes, int64_t dim, IntArrayRef sizes, const at::TensorOptions &options) {
   dim = at::maybe_wrap_dim(dim, sizes.size());
 
   // it's possible some of the grads are not defined (represents tensors of all 0s).
@@ -600,9 +779,9 @@ Tensor split_with_sizes_backward(const std::vector<torch::autograd::Variable> &g
       grads_all_defined[j] = grads[j];
     } else {
       auto length = split_sizes[j];
-      std::vector<int64_t> grad_size(sizes);
+      auto grad_size = sizes.vec();
       grad_size[dim] = length;
-      grads_all_defined[j] = at::zeros(grad_size, type);
+      grads_all_defined[j] = at::zeros(grad_size, options);
     }
   }
 
@@ -611,18 +790,18 @@ Tensor split_with_sizes_backward(const std::vector<torch::autograd::Variable> &g
 }
 
 Tensor split_backward(const std::vector<torch::autograd::Variable> &grads,
-                      int64_t split_size, int64_t dim, IntList sizes, const Type &type) {
+                      int64_t split_size, int64_t dim, IntArrayRef sizes, const at::TensorOptions &options) {
   dim = at::maybe_wrap_dim(dim, sizes.size());
   int64_t dim_size = sizes[dim];
   int64_t num_splits = grads.size();
   std::vector<int64_t> split_sizes(num_splits, split_size);
   split_sizes[num_splits - 1] = split_size - (split_size * num_splits - dim_size);
-  return split_with_sizes_backward(grads, split_sizes, dim, sizes, type);
+  return split_with_sizes_backward(grads, split_sizes, dim, sizes, options);
 }
 
 Tensor max_pool_double_backward(const Tensor & grad, const Tensor & indices, int dim) {
-  TORCH_ASSERT(indices.dim() >= dim);
-  auto size = std::vector<int64_t>(indices.sizes().slice(0, indices.dim() - dim));
+  AT_ASSERT(indices.dim() >= dim);
+  auto size = indices.sizes().slice(0, indices.dim() - dim).vec();
   size.push_back(-1);
   auto indices_view = indices.view(size);
   return grad.contiguous().view(size).gather(-1, indices_view).view(indices.sizes());
@@ -649,17 +828,17 @@ Tensor glu_double_backward(const Tensor & grad, const Tensor & grad_output, cons
 
 Tensor glu_double_backward_grad_output(const Tensor & grad, const Tensor & input, int64_t dim) {
   if (dim < 0) dim += input.dim();
-  std::vector<int64_t> sizes = input.sizes();
+  auto sizes = input.sizes().vec();
   sizes[dim] /= 2;
-  auto tmp = grad * glu_backward(at::ones(sizes, input.type()), input, dim);
+  auto tmp = grad * glu_backward(at::ones(sizes, input.options()), input, dim);
   return tmp.narrow(dim, 0, sizes[dim]) + tmp.narrow(dim, sizes[dim], sizes[dim]);
 }
 
-Tensor kl_div_double_backward_grad_output(const Tensor & grad, const Tensor & input, const Tensor & target, bool size_average, bool reduce) {
-  auto result = kl_div_backward(grad, input, target, size_average, false);
-  if (reduce && size_average) {
+Tensor kl_div_double_backward_grad_output(const Tensor & grad, const Tensor & input, const Tensor & target, int64_t reduction) {
+  auto result = kl_div_backward(grad, input, target, Reduction::None);
+  if (reduction == Reduction::Mean) {
     return result.mean();
-  } else if (reduce) {
+  } else if (reduction == Reduction::Sum) {
     return result.sum();
   }
   return result;
@@ -667,14 +846,33 @@ Tensor kl_div_double_backward_grad_output(const Tensor & grad, const Tensor & in
 
 // Compute derivatives for targets.
 // Assume targets are given as probabilities (i.e. without taking the logarithm).
-Tensor kl_div_target_backward(Tensor grad_output, Tensor self, Tensor target, bool size_average, bool reduce) {
-  if (!reduce) {
+Tensor kl_div_target_backward(Tensor grad_output, Tensor self, Tensor target, int64_t reduction) {
+  if (reduction == Reduction::None) {
     return grad_output.mul(target.log().add_(1).sub_(self)).masked_fill_(target == 0, 0.);
   }
-  if (size_average) {
+  if (reduction == Reduction::Mean) {
     return grad_output.mul(target.log().add_(1).sub_(self)).div_(target.numel()).masked_fill_(target == 0, 0.);
   }
   return grad_output.mul(target.log().add_(1).sub_(self)).masked_fill_(target == 0, 0.);
+}
+
+Tensor binary_cross_entropy_with_logits_target_backward(const Tensor& grad_output, const Tensor& self, const Tensor& target, const Tensor& weight, const Tensor& pos_weight, int64_t reduction) {
+  Tensor grad_target;
+  if (pos_weight.defined()) {
+    grad_target = (1. - self.sigmoid()).log_().sub_(pos_weight.mul(self.sigmoid().log_())).mul_(grad_output);
+  } else {
+    grad_target = self.mul(-grad_output);
+  }
+
+  if (weight.defined()) {
+    grad_target.mul_(weight);
+  }
+
+  if (reduction == Reduction::Mean) {
+    grad_target.div_(target.numel());
+  }
+
+  return grad_target;
 }
 
 Tensor log_sigmoid_double_backward(const Tensor & grad, const Tensor & input) {
@@ -704,115 +902,639 @@ Tensor log_softmax_double_backward(const Tensor & grad, const Tensor & grad_outp
   return z * grad_output.sum(dim, true) * ((grad * z).sum(dim, true) - grad);
 }
 
-Tensor l1_loss_double_backward_grad_output(const Tensor & grad, const Tensor & input, const Tensor & target, bool size_average, bool reduce) {
-  auto output = l1_loss_backward(grad, input, target, size_average, false);
-  if (reduce and size_average) {
+Tensor l1_loss_double_backward_grad_output(const Tensor & grad, const Tensor & input, const Tensor & target, int64_t reduction) {
+  auto output = l1_loss_backward(grad, input, target, Reduction::None);
+  if (reduction == Reduction::Mean) {
     return output.mean();
-  } else if (reduce) {
+  } else if (reduction == Reduction::Sum) {
     return output.sum();
   }
   return output;
 }
 
-Tensor smooth_l1_loss_double_backward(const Tensor & grad, const Tensor & input, const Tensor & target, bool size_average, bool reduce) {
+Tensor smooth_l1_loss_double_backward(const Tensor & grad, const Tensor & input, const Tensor & target, int64_t reduction) {
   auto d = (input - target).abs();
-  auto grad_input = grad * (d < 1).toType(grad.type());
-  if (size_average && reduce) {
+  auto grad_input = grad * (d < 1).type_as(grad);
+  if (reduction == Reduction::Mean) {
     grad_input /= input.numel();
   }
   return grad_input;
 }
 
-Tensor smooth_l1_loss_double_backward_grad_output(const Tensor & grad, const Tensor & grad_output, const Tensor & input, const Tensor & target, bool size_average, bool reduce) {
-  if (!reduce) {
-    return smooth_l1_loss_backward(grad, input, target, size_average, reduce);
+Tensor smooth_l1_loss_double_backward_grad_output(const Tensor & grad, const Tensor & grad_output, const Tensor & input, const Tensor & target, int64_t reduction) {
+  if (reduction == Reduction::None) {
+    return smooth_l1_loss_backward(grad, input, target, reduction);
   }
-  auto r = smooth_l1_loss_backward(ones_like(grad_output), input, target, size_average, true);
+  auto r = smooth_l1_loss_backward(ones_like(grad_output), input, target, reduction);
   return (r * grad).sum();
 }
 
-static inline int64_t diag_size(int64_t height, int64_t width, int64_t diagonal) {
-  if (width > height) {
-    return diag_size(width, height, -diagonal);
-  }
-  // Assumes height >= width
-  auto longest_diag = width;
-  if (diagonal >= 0) {
-    return longest_diag - diagonal;
-  }
-  if (longest_diag < height + diagonal) {
-    return longest_diag;
-  }
-  return height + diagonal;
-}
-
-Tensor diag_backward(const Tensor & grad, IntList input_sizes, int64_t diagonal) {
+Tensor diag_backward(const Tensor & grad, IntArrayRef input_sizes, int64_t diagonal) {
   auto ndimension = input_sizes.size();
-  TORCH_ASSERT(ndimension == 1 || ndimension == 2);
+  AT_ASSERT(ndimension == 1 || ndimension == 2);
 
   if (ndimension == 1 || input_sizes[0] == input_sizes[1]) {
     return grad.diag(diagonal);
   }
 
   // Input was a matrix but was not square
-  auto grad_input = at::zeros(input_sizes, grad.type());
-  auto diagonal_size = diag_size(input_sizes[0], input_sizes[1], diagonal);
-  auto storage_offset = diagonal >= 0 ? diagonal : -diagonal * input_sizes[1];
-  auto diag = grad_input.as_strided({diagonal_size}, {input_sizes[1] + 1}, storage_offset);
+  auto grad_input = at::zeros(input_sizes, grad.options());
+  auto diag = grad_input.diagonal(diagonal);
   diag.copy_(grad);
   return grad_input;
 }
 
-Tensor diagonal_backward(const Tensor & grad, IntList input_sizes, int64_t offset, int64_t dim1, int64_t dim2) {
-  auto grad_input = at::zeros(input_sizes, grad.type());
+Tensor diagonal_backward(const Tensor & grad, IntArrayRef input_sizes, int64_t offset, int64_t dim1, int64_t dim2) {
+  auto grad_input = at::zeros(input_sizes, grad.options());
   auto diag = grad_input.diagonal(offset, dim1, dim2);
   diag.copy_(grad);
   return grad_input;
 }
 
-Tensor mse_loss_double_backward(const Tensor & grad, const Tensor & input, bool size_average, bool reduce) {
+Tensor mse_loss_double_backward(const Tensor & grad, const Tensor & input, int64_t reduction) {
   auto grad_input = 2 * grad;
-  if (size_average && reduce) {
+  if (reduction == Reduction::Mean) {
     grad_input /= input.numel();
   }
   return grad_input;
 }
 
-Tensor mse_loss_double_backward_grad_output(const Tensor & grad, const Tensor & grad_output, const Tensor & input, const Tensor & target, bool size_average, bool reduce) {
-  if (!reduce) {
-    return mse_loss_backward(grad, input, target, size_average, reduce);
+Tensor mse_loss_double_backward_grad_output(const Tensor & grad, const Tensor & grad_output, const Tensor & input, const Tensor & target, int64_t reduction) {
+  if (reduction == Reduction::None) {
+    return mse_loss_backward(grad, input, target, reduction);
   }
-  auto r = mse_loss_backward(ones_like(grad_output), input, target, size_average, true);
+  auto r = mse_loss_backward(ones_like(grad_output), input, target, reduction);
   return (r * grad).sum();
 }
 
-Tensor soft_margin_loss_double_backward(const Tensor & grad, const Tensor & input, const Tensor & target, bool size_average, bool reduce) {
+Tensor soft_margin_loss_double_backward(const Tensor & grad, const Tensor & input, const Tensor & target, int64_t reduction) {
   auto z = (input * -target).exp();
   auto zplus1 = z + 1;
   auto grad_input = grad * (target * target) * z / (zplus1 * zplus1);
-  if (size_average && reduce) {
+  if (reduction == Reduction::Mean) {
     grad_input /= input.numel();
   }
   return grad_input;
 }
 
-Tensor soft_margin_loss_double_backward_grad_output(const Tensor & grad, const Tensor & grad_output, const Tensor & input, const Tensor & target, bool size_average, bool reduce) {
-  if (!reduce) {
-    return soft_margin_loss_backward(grad, input, target, size_average, reduce);
+Tensor soft_margin_loss_double_backward_grad_output(const Tensor & grad, const Tensor & grad_output, const Tensor & input, const Tensor & target, int64_t reduction) {
+  if (reduction == Reduction::None) {
+    return soft_margin_loss_backward(grad, input, target, reduction);
   }
-  auto r = soft_margin_loss_backward(ones_like(grad_output), input, target, size_average, true);
+  auto r = soft_margin_loss_backward(ones_like(grad_output), input, target, reduction);
   return (r * grad).sum();
 }
 
 Tensor softplus_double_backward(const Tensor & grad, const Tensor & input, Scalar beta, Scalar threshold) {
   auto x = (input * beta);
-  return _sigmoid_backward(grad, x.sigmoid()) * (x < threshold).toType(grad.type()) * beta;
+  return sigmoid_backward(grad, x.sigmoid()) * (x < threshold).type_as(grad) * beta;
 }
 
-Tensor as_strided_backward(const Tensor & grad, TensorGeometry base, IntList sizes, IntList strides, int64_t storage_offset) {
-  auto src = base.zeros_with_stride(grad.type());
-  src.as_strided(sizes, strides, storage_offset - base.storage_offset()).copy_(grad);
-  return src;
+
+// NOTE [ as_strided Backward and layout-aware/agnostic autograd ]
+//
+// `storage_offset` is ignored for simplicity in this note. If you just want the
+// full algorithm without explanation, scroll down to bottom of this note.
+//
+// Implementing the backward of as_strided is tricky because you have to deal
+// with mappings that map one memory location to multiple indices, i.e., the
+// output tensor has multiple indices pointing to **overlapping** memory
+// addresses. This can happen in all in all sorts of weird cases. For example,
+//
+//   x = torch.randn(15)
+//   x.as_strided([3, 3], [1, 0])  # "expand" case
+//   x.as_strided([3, 3], [2, 1])  # "size too large" case
+//   x.as_strided([3, 2], [3, 6])  # res[2, 0] points to 2*3 + 0*6 = 6
+//                                 # res[0, 1] points to 0*3 + 1*6 = 6
+//
+// Here is the general strategy we apply in implementing as_strided backward:
+//   0. ??? (optimization step. we will talk about this later)
+//   1. Create some underlying flattened tensor as if it is the base tensor
+//      representing the contiguous memory storage for both input and output.
+//   2. Use the output geometry to scatter (or index_add) the gradients into
+//      this storage tensor.
+//   3. ??? (fix for input tensor with overlapping memory. we will talk about
+//           this later)
+//   4. Return the as_strided view of the storage tensor using input geometry.
+//
+// In step (2), if the output tensor does't have overlapping memory, we can
+// safely scatter (`storage.as_strided(output_geometry).copy_(grad)`);
+// otherwise, we must use `index_add` as gradients at different indices may need
+// to be summed to a single location.
+//
+// For example, in this case:
+//
+//   x = torch.randn(3)
+//   y = x.as_strided([3, 3], [1, 0])  # "expand" case
+//                                     # size   [ 3, 3]
+//                                     # stride [ 1, 0]
+//   y.backward()  # step (1): contiguous storagte tensor `s` of size 3, which
+//                             is large enough to be used as underlying storage
+//                             for `x` and `y`.
+//                               s = [ 0, 0, 0]
+//                 # step (2): since `y` has overlapping memory, index_add grad
+//                             into `s` basing on `y`'s geometry, i.e.,
+//                             s[i * y.stride(0) + j * y.stride(1)] += gy[i, j].
+//                               s = [ 3, 3, 3]
+//                 # step (4): as_strided view `s` using `x`'s geometry
+//                               s = [ 3, 3, 3]
+//                               grad_input = s.as_strided(x.size(), x.stride())
+//                                          = s.as_strided([3], [1])
+//                                          = [ 3, 3, 3]
+//
+// This is exactly what we would get if using `expand`. However, here the input
+// tensor doesn't have overlapping memory. If it does, we must add an extra step
+// before (4). Considering this case:
+//
+//   t = torch.randn(3)
+//   x = t.expand(3, 3)            # input with overlapping memory
+//                                 # size   [3, 3]
+//                                 # stride [0, 1]
+//   y = x.as_strided([1], [1])    # contiguous output
+//                                 # size   [1]
+//                                 # stride [1]
+//   y.backward()  # step (1): contiguous storage tensor `s` of size 3, which
+//                             is large enough to be used as underlying storage
+//                             for `x` and `y`.
+//                               s = [ 0, 0, 0]
+//                 # step (2): scatter grad into `s` basing on `y`'s geometry
+//                               s = [ 1, 0, 0]
+//                 # step (4): as_strided view `s` using `x`'s geometry
+//                               s = [ 1, 0, 0]
+//                               grad_input = s.as_strided([3, 3], [0, 1])
+//                                          = s.as_strided([3, 3], [0, 1])
+//                                          = [[ 1, 0, 0],
+//                                             [ 1, 0, 0],
+//                                             [ 1, 0, 0]]
+// Is this result correct?
+//
+// `x.as_strided([1], [1])` call is obviously equivalent with
+// `x[(0,) * x.dim()].view(1)` for any `x`. But autograd through the second
+// gives gradient `[ [ 1, 0, 0], [ 0, 0, 0], [ 0, 0, 0]]`. For this specific
+// case, indexing `x` at any index in first column is also equivalent, and
+// yields a gradient of shape `[3 x 3]` containing eight 0's and one 1. There is
+// an `x.size(1)`-times difference between these gradients computed from other
+// PyTorch ops and the gradient we got from as_strided.
+//
+// You might conclude that the gradients from as_strided is wrong. However,
+// let's first see why they are actually reasonable. Consider the pointwise
+// perturbations by `delta` anywhere in the first column of `x`. It will lead to
+// a `delta` change in the same memory location, and then `y` will change by
+// `delta`. So one can say the gradient should be exactly 1 at the first column,
+// as given by our above procedure.
+//
+// In the above computation of numerical gradients, they only match the
+// analytical results because strides and memory locations are considered in the
+// forward pass, i.e., this op (including both forward and backward) is
+// layout-aware.
+//
+// However, in PyTorch, most (probably all) other ops (forward and backward) are
+// layout-agnostic. E.g.,
+//
+//   t = torch.randn(1)
+//   x = t.expand(2)
+//   y = x.sum()
+//   y.backward()
+//
+// Layout-agnostic autograd (as it is currently in PyTorch) will give you
+//
+//   gy = 1
+//   gx = [ 1, 1]  # SumBackward:    torch.ones_like(x)
+//   gt = [ 2]     # ExpandBackward: gx.sum()
+//
+// Note that `gx = [ 1, 1]`. However, if you perturb any value in `x` by `delta`
+// (the other will also change by `delta`), `y` will change by `2 * delta`. So
+// the gradients, if strides are taken into consideration, should be 2.
+//
+// Layout-aware autograd should give you
+//
+//   gy = 1
+//   gx = [ 2, 2]  # Because the backward considers the fact that the input `x`
+//                 # is already expanded.
+//   gt = [ 2]     # Layout-aware backward of expand is just a slicing because
+//                 # the previous backward should have already taken care of
+//                 # strides and made sure that gradients are the same along the
+//                 # expanded dimension.
+//
+// As shown above, these two types are not compatible. Therefore, we must either
+// make as_strided layout-agnostic, or make all other ops layout-aware.
+//
+// It is difficult to support layout-aware autograd (at least in the current
+// codebase structure), because it would mean
+//   1. storing tensor geometries of every input tensor for backward
+//   2. depending on input geometry, the gradient computed from backward change
+//   3. ideally enforcing gradient of T to always have same strides as T
+// (although these two methods only differ when it comes to overlapping memory)
+//
+// Therefore, we must formulate `as_strided` in a layout-agnostic way, i.e.,
+// giving the same output regardless of the input layout. We consider
+// `input.stride()` as a separate independent fixed argument `input_stride`.
+// Then, `as_strided(input, size, stride)` can be thought of as:
+//   1. "Scatter" each value of `input` into a "storage" using storage location
+//      computed from the value's index in `input`, `input.size()` and
+//      `input_stride`, but if N values end up in the same location, the value
+//      is average of those N values (they will be the same value anyways).
+//
+//      Formal description:
+//        Denote the set of all input indices that pointing to the same storage
+//        location `storage[n]` as `S(n)`, i.e.,
+//
+//            S(n) = { index : <index, input_stride> == n, index is valid given input.size() },
+//
+//        where `<x, y>` is the dot product between `x` and `y`.
+//
+//        Then, the process is:
+//
+//            storage[n] = Avg { S(n) }
+//
+//        Note that all values in `S(n)` are the same (they point to the same
+//        memory location anyways, so this step doesn't change anything, but
+//        effectively avoids having the denpendency on the layout of `input`.
+//        I.e., the result holds fixed regardless of the layout of `input`, as
+//        long as `input_stride` is fixed.
+//
+//      NOTE: for forward pass, we can equivalently simply selet any one of
+//            `S(n)` as `storage[n]`. However, cosnidering this as an average
+//            operation makes backward easier (so all values in set
+//            `{ grad_input[i] : i in S(n) }` are the same, and it can use the
+//            same geometry as input).
+//   2. As usual, return the as_strided view of `storage` using required output
+//      `size` and `stride`.
+//
+// To backward through this layout-agnostic version, we simply add the following
+// step:
+//   .... (scatter gradients into the storage tensor using output geometry)
+//   3. For all storage location n, `storage[n] /= |S(n)|`.
+//   .... (return as_strided view of the storage tensor using input geometry)
+//
+// Finally, we note that these general operations are expensive, so we apply the
+// following optimizations:
+//   Add step (0): For all output dimension `d` with output stride 0, sum the
+//                 gradients along dimension `d` (don't keepdim), and remove
+//                 dimension `d` from output size and stride.
+//                 (An optimization for "expand" cases so we may avoid step (3))
+//  Only apply step (3) when input tensor has overlapping memory.
+//
+// FULL ALGORITHM:
+//   0. For all output dimension `d` with output stride 0, sum the gradients
+//       along dimension `d` (don't keepdim), and remove dimension `d` from
+//       output size and stride.
+//   1. Create some underlying flattened tensor as if it is the base tensor
+//      representing the contiguous memory storage for both input and output.
+//   2. Use the output geometry to scatter (or index_add) the gradients into
+//      this storage tensor `storage`.
+//   3. If input tensor has overlapping memory,
+//      For all storage location `i`, `storage[i] /= N(i)`, where `N(i)` is the
+//      number of indices in input geometry pointing to the same storage
+//      location `i` (i.e., `|S(i)|` in equations above).
+//   4. Return the as_strided view of the storage tensor using input geometry.
+//
+// See NOTE [ Detecting Memory Overlap Within A Strided Tensor ] on how to
+// roughly detech overlapping memory.
+
+
+// NOTE [ Detecting Memory Overlap Within A Strided Tensor ]
+//
+// Checking memory overlap within a strided tensor is the special case of
+// detecting memory overlap of two strided tensors, where the two tensors start
+// at the same memory address. The later is HARD (see #8212).
+//
+// But even this special case isn't simple. This note describes a check for a
+// even more constrained simple case where we can be certain that there is no
+// overlap.
+//
+// The checking algorithm can be described as:
+//   0. Return [ pass check ] if any dimension has size 0
+//   1. Ignore all dimensions that have size 1
+//   2. If no remaining dimensions, return [ pass check ]
+//   3. Sort the remaining dimensions according to the strides decreasingly
+//   4. Check that for each dimension k,
+//
+//           stride[k] > \sum_{ i > k } (size[i] - 1) * stride[i]
+//
+//      That is equivalent to, after reordering the dimensions so strides are
+//      in decreasing order, checking that stride of each dimension is larger
+//      than the maximum memory offset in a slice at that dimension.
+//
+// Obviously this check passes for contiguous tensors ( the dimensions will be
+// already sorted with LHS = stride[0] = \prod size[i] being exactly 1 larger
+// than RHS ). Similarly, the check passes for tensors contiguous in all but
+// the last dimension, and LHS = stride[0] = stride[-1] * \prod size[i] being
+// exactly stride[-1] larger than RHS. (*)
+//
+// We will show that these view operations, including all our view operations
+// *except for* general as_strided and unfold, also preserve this invariant:
+//
+//  alias:      Obviously preserves
+//
+//  expand:     All changed dimensions are removed in step (1)
+//
+//  view:       Consider the input dimensions as grouped into consecutive
+//              dimension "blocks", where dimensions are contiguous in each one.
+//              one. view only works when the output dimensions can also be
+//              grouped into the same consecutive blocks of same ordering.
+//
+//              NB: this means that the number of elements and stride of the
+//                  last dimension in each block is the same in input and
+//                  output. (**)
+//
+//              Notation:
+//                Consider a single such block B,
+//                    ... B_prev[-1]], [ B[0], ..., B[i], ..., B[k] = B[-1] ], [ B_next[0], ...
+//                                start--^^^^                  ^^^^^^^^^^^^--end
+//                Each B[i] denotes a dimension index such that B[i] = B[0] + i.
+//
+//              We first show that in a tensor (i.e., input) satisfies the
+//              invariant, after sorting, the dimensions within each block
+//              still remain consecutive. (***)
+//
+//                After removing dimensions of size 1, the dimensions within a
+//                block is already sorted by strides in descending order. So
+//                sorting all dimensions will not change the relative ordering
+//                among them.
+//
+//                Assume that some block B is not consecutive after sorting,
+//                i.e., there exists a dimension d between B[0] and B[-1] in
+//                sorted order.
+//
+//                By (*), we know that
+//                       stride[B[0]]
+//                    =  \sum_{i > 0}   (size[B[i]] - 1) * stride[B[i]] + stride[B[-1]]
+//                    <  \sum_{i > 0}   (size[B[i]] - 1) * stride[B[i]] + stride[d]
+//                    <= \sum_{i > 0}   (size[B[i]] - 1) * stride[B[i]] + (size[d] - 1) * stride[d]
+//                    <= \sum{j > B[0]} (size[j]    - 1) * stride[j],
+//
+//                where the first <   comes from sorting and
+//                      the second <= comes from the fact that dimension d
+//                                               exists after step (1) and
+//                                               thus must have size greater
+//                                               than 1
+//                      the third  <= comes from the fact that each term in
+//                                               the sum is non-negative
+//
+//                Then we have a countradiction as the invariant must not be
+//                satisfied at B[0]. So the original proposition is true.
+//
+//              Now that we established the above claim (***), we consider the
+//              view operation as first sorting the dimensions (i.e., blocks),
+//              apply the original view (since it only cares dimensions being
+//              consecutive and contiguous withtin each block), and then undo
+//              the sort.
+//
+//              Consider a single block B in the output,
+//                  ... ], [ B[0], ..., B[i], ..., B[k] = B[-1] ], [ ...
+//                    start--^^^^                  ^^^^^^^^^^^^--end
+//
+//              By (*), we know that for all i
+//                  stride[i] = stride[B[-1]] +
+//                                \sum_{j=i+1}^{k} (size[B[j]] - 1) * stride[B[j]]
+//
+//              Then the invariant is obviously satisfied at every dimension
+//              in this block if it is satisfied at dimnesion B[-1]. It only
+//              remains to show that it is satisfied at the last dimension in
+//              each block.
+//
+//              Since the same blocks are present in both input and output
+//              with the same ordering, we will abuse the notation in the
+//              following statements.
+//
+//              By (*), we know that the following holds for both input and
+//              output, for any block B:
+//                    \sum_{i > B[-1]} (size[i] - 1) * stride[i]
+//                  = \sum_{block B' after B} \prod_{j in B'} size[B[j]] * stride[B'[-1]]
+//                  = \sum_{block B' after B} numel(B') * stride[B'[-1]].
+//                    ^^^^^^^^^^^^^^^^^^^^^^^|^^^^^^^^^^^^^^^^^^^^^^^^^^
+//              By (**), we know that, this quantity in the above equation
+//              remains the same in input and output. So both
+//                  \sum_{i > B[-1]} (size[i] - 1) * stride[i]
+//              and
+//                  stride[B[-1]]
+//              are the same in input and output.
+//
+//              These two quantities are exactly the LHS and RHS of the
+//              invariant inequality. Since by assumption the invariant is
+//              satisfied in input at B[-1], it is also satisfied in output at
+//              B[-1]. This concludes the proof.
+//
+//  squeeze:    Special case of view
+//
+//  unsqueeze:  Special case of view
+//
+//  slice:      Consider slicing dimension i with step = k >= 1.
+//
+//              Let stride' and size' be the output strides and sizes. We have
+//
+//                  stride'[i] = k * stride[i]
+//                  size'[i] <= floor(size[i] / k)
+//
+//              If size'[i] = 1, invariant is obviously satisfied as we are
+//              just removing a dimension (afte step (1)).
+//
+//              Assume size'[i] > 1.
+//
+//              By assumption, the invariant is satisfied at every dimension
+//              in input.
+//
+//              For any dimension j, if stride[j] > stride[i], we have
+//                  stride'[j] =  stride[j]
+//                             >  (size[i] - 1) * stride[i]
+//                             =  (size[i] / k * k - 1) * k * stride[i] / k
+//                             =  (size[i] / k - 1 / k) * stride'[i]
+//                             >= (size'[i]    - 1 / k) * stride'[i]
+//                             >= stride'[i].
+//
+//              If stride[j] < stride[i], we have
+//                  stride'[j] = stride[j] < stride[i] <= stride'[i].
+//
+//              So the sorting order remains unchanged after slice.
+//
+//              Since
+//                     (size'[i] - 1) * stride'[i]
+//                  =  (floor(size[i] / k) - 1) * k * stride[i]
+//                  <= (size[i] / k - 1) * k * stride[i]
+//                  =  (size[i] - k) * stride[i]
+//                  <= (size[i] - 1) * * stride[i],
+//              the term from this dimension i in the invariant inequality at
+//              other dimensions can only decrease after slice. So the
+//              invariant is preserved.
+//
+//  narrow:     Special case of slice
+//
+//  select:     narrow + squeeze
+//
+//  permute:    Sorting makes permutation of dimensions irrelevant
+//
+//  transpose:  Sorting makes swapping dimensions irrelevant
+//
+//  diagonal:   Effectively merging two dimensions i and j into a new
+//              dimension k s.t.
+//                  stride'[k] =  stride[i] + stride[j]
+//                  size'[k]   <= min(size[i], size[j]),
+//              where stride and size are on the input, and stride' and size'
+//              are on the output.
+//
+//              Assuming that size[i] > 1 and size[j] > 1. If any has size 1,
+//              then this is unsqueeze on that dimension.
+//
+//              WLOG, say stride[i] >= stride[j].
+//
+//              Each dimension d in input with stride[d] > stride[j] has
+//                  stride'[d] =  stride[d]
+//                             >  (size[i] - 1) * stride[i] + (size[j] - 1) * stride[j]
+//                             >= stride[i] + stride[j]
+//                             =  stride[k].
+//              So, considering the sorted dimensions, this is effectively
+//              removing i, and replacing j with k.
+//
+//              For dimensions d with stride[i] < stride[d] < stride[j], the
+//              term from dimension i is removed in the invariant inequality.
+//              For dimensions d with stride[d] > stride[j], we have
+//                     (size'[k] - 1) * stride'[k]
+//                  <= (min(size[i], size[j]) - 1) * (stride[i] + stride[j])
+//                  <= (size[i] - 1) * stride[i] + (size[j] - 1) * stride[j],
+//              so the term from i and j in the invariant can only decrease.
+//
+//              So this is generally relaxing the constraint, and thus it
+//              preserves it.
+
+// This implements steps (2)~(4) of the algorithm in
+// NOTE [ Detecting Memory Overlap Within A Strided Tensor ]
+// Helper for as_strided_backward
+static inline bool _maybe_overlapping_memory(IntArrayRef sizes, IntArrayRef strides) {
+  if (sizes.size() > 0) {
+    std::vector<std::size_t> argsort(sizes.size());
+    std::iota(argsort.begin(), argsort.end(), 0);
+    std::sort(argsort.begin(), argsort.end(),
+        [&](std::size_t i, std::size_t j){ return strides[i] < strides[j]; });
+
+    int64_t max_index_in_slice = 0;
+    for (auto i : argsort) {
+      auto stride_ = strides[i];
+      if (stride_ <= max_index_in_slice) {
+        return true;
+      }
+      max_index_in_slice += stride_ * (sizes[i] - 1);
+    }
+  }
+  return false;
+}
+
+// Returns the minimum storage size needed to contain a tensor of sizes, strides, and storage_offset
+// Helper for as_strided_backward
+static inline int64_t _min_storage_size(IntArrayRef sizes, IntArrayRef strides, int64_t storage_offset) {
+  int64_t storage_size = storage_offset + 1;
+  int64_t dim = sizes.size();
+  for (int64_t i = 0; i < dim; i++) {
+    auto size_i = sizes[i];
+    if (size_i == 0) {
+      return storage_offset;
+    }
+    storage_size += (size_i - 1) * strides[i];
+  }
+  return storage_size;
+}
+
+// See NOTE [ as_strided Backward and layout-aware/agnostic autograd ] for explanation
+Tensor as_strided_backward(Tensor grad, TensorGeometry input_geometry, IntArrayRef sizes, IntArrayRef strides, optional<int64_t> storage_offset_) {
+  // For output geometry,
+  //   check for size 0 dimensions,
+  //   skip size 1 dimensions,
+  //   reduce grad on expanded dims (stride=0, size>1)
+  // Step (0)     for the algorithm in NOTE [ as_strided Backward and layout-aware/agnostic autograd ]
+  // Step (0)~(1) for the algorithm in NOTE [ Detecting Memory Overlap Within A Strided Tensor ]
+  //              on output geometry
+  auto storage_offset = storage_offset_.value_or(input_geometry.storage_offset());
+  auto odim = grad.dim();
+  std::vector<int64_t> out_sizes_, out_strides_;
+  out_sizes_.reserve(odim);
+  out_strides_.reserve(odim);
+  for (int64_t i = odim - 1; i >= 0; i--) {
+    auto size_i = sizes[i];
+    auto stride_i = strides[i];
+    if (size_i == 0) {
+      return at::zeros(input_geometry.sizes(), grad.options());
+    } else if (size_i == 1) {
+      grad = grad.squeeze(i);
+    } else if (stride_i == 0) {
+      grad = grad.sum(i, false);
+    } else {
+      out_sizes_.insert(out_sizes_.begin(), size_i);
+      out_strides_.insert(out_strides_.begin(), stride_i);
+    }
+  }
+  // Step (2)~(4) for the algorithm in NOTE [ Detecting Memory Overlap Within A Strided Tensor ]
+  //              on output geometry
+  auto out_maybe_overlap = _maybe_overlapping_memory(out_sizes_, out_strides_);
+
+  // For input geometry,
+  //   check for size 0 dimensions,
+  //   skip size 1 dimensions,
+  // Step (0)~(1) for the algorithm in NOTE [ Detecting Memory Overlap Within A Strided Tensor ]
+  //              on input geometry
+  auto idim = input_geometry.dim();
+  IntArrayRef inp_sizes = input_geometry.sizes(), inp_strides = input_geometry.strides();
+  std::vector<int64_t> inp_sizes_, inp_strides_;
+  inp_sizes_.reserve(idim);
+  inp_strides_.reserve(idim);
+  for (int64_t i = idim - 1; i >= 0; i--) {
+    auto size_i = inp_sizes[i];
+    auto stride_i = inp_strides[i];
+    if (size_i == 0) {
+      return at::zeros(input_geometry.sizes(), grad.options());
+    } else if (size_i != 1) {
+      inp_sizes_.insert(inp_sizes_.begin(), size_i);
+      inp_strides_.insert(inp_strides_.begin(), stride_i);
+    }
+  }
+  // Step (1)~(4) for the algorithm in NOTE [ Detecting Memory Overlap Within A Strided Tensor ]
+  //              on input geometry
+  auto inp_maybe_overlap = _maybe_overlapping_memory(inp_sizes_, inp_strides_);
+
+
+  // Rest of this function implements
+  // Step (1)~(4) for the algorithm in NOTE [ as_strided Backward and layout-aware/agnostic autograd ]
+  // TODO: Raise if not all output values are visible in input geometry.
+  //       Technically speaking, if you treat those values as constants, not
+  //       raising is fine, and mathematically correct. However, these values
+  //       really are contained in some base tensor, and by treating them as
+  //       constants we are ignoring this tight dependency. Therefore, it is
+  //       more sensible to raise here.
+
+  // Step (1): create underlying tensor as "storage"
+  auto shared_offset = std::min(input_geometry.storage_offset(), storage_offset);
+  auto inp_effective_offset = input_geometry.storage_offset() - shared_offset;
+  auto out_effective_offset = storage_offset - shared_offset;
+  auto base_size = std::max(
+    _min_storage_size(inp_sizes_, inp_strides_, inp_effective_offset),
+    _min_storage_size(out_sizes_, out_strides_, out_effective_offset)
+  );
+  auto storage = at::zeros({base_size}, grad.options());
+
+  // prepare indices tensor if we will do index_add_ later
+  c10::optional<at::Tensor> flatten_full_indices;
+  if (inp_maybe_overlap || out_maybe_overlap) {
+    flatten_full_indices = at::arange(0, base_size, grad.options().dtype(at::kLong));
+  }
+
+  // Step (2): use output geometry to scatter gradients into storage
+  if (out_maybe_overlap) {
+    auto out_indices = flatten_full_indices->as_strided(out_sizes_, out_strides_, out_effective_offset);
+    storage.index_add_(0, out_indices.reshape(-1), grad.reshape(-1));
+  } else {
+    // assume that new tensors have 0 storage offset
+    storage.as_strided(out_sizes_, out_strides_, out_effective_offset).copy_(grad);
+  }
+
+  // Step (3): if input tensor has overlapping memory, divide scattered gradient
+  //           at storage[i] by the number of times i shows up in input geometry
+  if (inp_maybe_overlap) {
+    auto count = at::zeros_like(storage);
+    auto inp_indices = flatten_full_indices->as_strided(inp_sizes_, inp_strides_, inp_effective_offset).reshape(-1);
+    count.index_add_(0, inp_indices, at::ones({1}, grad.options()).expand_as(inp_indices));
+    storage.div_(count); // this will give nan outside visible range
+  }
+  // Step (4): return as_strided view of the storage tensor with input geometry
+  return storage.as_strided(inp_sizes, inp_strides, inp_effective_offset);
 }
 
 std::tuple<Tensor, Tensor> atan2_backward(const Tensor& grad, const Tensor& self, const Tensor& other, std::array<bool, 2> output_mask) {
@@ -826,26 +1548,28 @@ std::tuple<Tensor, Tensor> atan2_backward(const Tensor& grad, const Tensor& self
 // each output separately; there is not all that much sharing
 // of computation going on here.
 std::tuple<Tensor, Tensor, Tensor> prelu_double_backward(
-    const Tensor & mb_ggI,
-    const Tensor & mb_ggW,
-    const Tensor & mb_gO,
-    const Tensor & input,
-    const Tensor & weight,
-    std::array<bool, 3> output_mask) {
+    const Tensor & grad_grad_input,
+    const Tensor & grad_grad_weight,
+    const Tensor & grad_out,
+    const Tensor & input_,
+    const Tensor & weight_) {
+
+    auto input = input_.contiguous();
+    auto weight = weight_.contiguous();
 
   // Zero-fill undefined grads (TODO: do this more efficiently)
-  auto ggI = mb_ggI.defined() ? mb_ggI : input.type().zeros_like(input);
-  auto ggW = mb_ggW.defined() ? mb_ggW : weight.type().zeros_like(weight);
-  auto gO = mb_gO.defined() ? mb_gO : input.type().zeros_like(input);
+  auto ggI = grad_grad_input.defined() ? grad_grad_input.contiguous() : at::zeros_like(input);
+  auto ggW = grad_grad_weight.defined() ? grad_grad_weight.contiguous() : at::zeros_like(weight);
+  auto gO = grad_out.defined() ? grad_out.contiguous() : at::zeros_like(input);
 
   auto positive_mask = (input > 0).type_as(ggI);
   auto nonpositive_mask = (input <= 0).type_as(ggW);
 
   // Explanation: Let input be i, weight be w, grad_output be gO.
-  // f(i, w) = i  if i > 0
-  //         = wi if i <= 0
-  // df/di * gO  = gO      if i > 0      df/dw * g0 = 0      if i > 0
-  //             = g0 * w  if i <= 0                = g0 * i  if i <= 0
+  // f(i, w) = i      if i > 0
+  //         = w * i  if i <= 0
+  // gI = df/di * gO  = gO      if i > 0    gW = df/dw * gO = 0       if i > 0
+  //                  = gO * w  if i <= 0                   = gO * i  if i <= 0
   // The rest is taking derivatives of these wrt i, w, gO and summing/expanding properly.
 
   if (weight.numel() == 1) {
@@ -889,7 +1613,7 @@ std::tuple<Tensor, Tensor, Tensor> prelu_double_backward(
       }
 
       Tensor ggO;
-      if (output_mask[0]) {
+      if (gO.requires_grad()) {
           // expand weight as input as in ggW/ggI above
           auto weight_expanded = weight;
           for (int64_t i = 0; i < dims_to_unsqueeze; i++) {
@@ -908,10 +1632,14 @@ std::tuple<Tensor, Tensor, Tensor> prelu_double_backward(
 //
 // This makes no assumption on the signs of sigma.
 Tensor svd_backward(const std::vector<torch::autograd::Variable> &grads, const Tensor& self,
-          bool some, const Tensor& raw_u, const Tensor& sigma, const Tensor& raw_v) {
-  auto m = self.size(0);
-  auto n = self.size(1);
-  auto k = sigma.size(0);
+          bool some, bool compute_uv, const Tensor& raw_u, const Tensor& sigma, const Tensor& raw_v) {
+  TORCH_CHECK(compute_uv,
+           "svd_backward: Setting compute_uv to false in torch.svd doesn't compute singular matrices, ",
+           "and hence we cannot compute backward. Please use torch.svd(compute_uv=True)");
+
+  auto m = self.size(-2);
+  auto n = self.size(-1);
+  auto k = sigma.size(-1);
   auto gsigma = grads[1];
 
   auto u = raw_u;
@@ -923,22 +1651,22 @@ Tensor svd_backward(const std::vector<torch::autograd::Variable> &grads, const T
     // We ignore the free subspace here because possible base vectors cancel
     // each other, e.g., both -v and +v are valid base for a dimension.
     // Don't assume behavior of any particular implementation of svd.
-    u = raw_u.narrow(1, 0, k);
-    v = raw_v.narrow(1, 0, k);
+    u = raw_u.narrow(-1, 0, k);
+    v = raw_v.narrow(-1, 0, k);
     if (gu.defined()) {
-      gu = gu.narrow(1, 0, k);
+      gu = gu.narrow(-1, 0, k);
     }
     if (gv.defined()) {
-      gv = gv.narrow(1, 0, k);
+      gv = gv.narrow(-1, 0, k);
     }
   }
-  auto vt = v.t();
+  auto vt = v.transpose(-2, -1);
 
   Tensor sigma_term;
   if (gsigma.defined()) {
-    sigma_term = u.mm(gsigma.diag()).mm(vt);
+    sigma_term = at::matmul(u, at::matmul(gsigma.diag_embed(/*offset=*/0, /*dim1=*/-2, /*dim2=*/-1), vt));
   } else {
-    sigma_term = at::zeros({1}, self.type()).expand_as(self);
+    sigma_term = at::zeros_like(self);
   }
   // in case that there are no gu and gv, we can avoid the series of kernel
   // calls below
@@ -946,103 +1674,311 @@ Tensor svd_backward(const std::vector<torch::autograd::Variable> &grads, const T
     return sigma_term;
   }
 
-  auto ut = u.t();
-  auto im = eye(m, self.type());
-  auto in = eye(n, self.type());
-  auto sigma_mat = sigma.diag();
-  auto sigma_mat_inv = sigma.pow(-1).diag();
-  auto sigma_expanded_sq = sigma.pow(2).expand_as(sigma_mat);
-  auto F = sigma_expanded_sq - sigma_expanded_sq.t();
+  auto ut = u.transpose(-2, -1);
+  auto im = at::eye(m, self.options());
+  auto in = at::eye(n, self.options());
+  auto sigma_mat = sigma.diag_embed(/*offset=*/0, /*dim1=*/-2, /*dim2=*/-1);
+  auto sigma_mat_inv = sigma.pow(-1).diag_embed(/*offset=*/0, /*dim1=*/-2, /*dim2=*/-1);
+  auto sigma_sq = sigma.pow(2);
+  auto F = sigma_sq.unsqueeze(-2) - sigma_sq.unsqueeze(-1);
   // The following two lines invert values of F, and fills the diagonal with 0s.
   // Notice that F currently has 0s on diagonal. So we fill diagonal with +inf
   // first to prevent nan from appearing in backward of this function.
-  F.as_strided({k}, {k + 1}).fill_(INFINITY);
+  F.diagonal(/*offset=*/0, /*dim1=*/-2, /*dim2=*/-1).fill_(INFINITY);
   F = F.pow(-1);
 
   Tensor u_term, v_term;
 
   if (gu.defined()) {
-    u_term = u.mm(F.mul(ut.mm(gu) - gu.t().mm(u))).mm(sigma_mat);
+    u_term = at::matmul(u, at::matmul(F.mul(at::matmul(ut, gu) - at::matmul(gu.transpose(-2, -1), u)), sigma_mat));
     if (m > k) {
-      u_term = u_term + (im - u.mm(ut)).mm(gu).mm(sigma_mat_inv);
+      u_term = u_term + at::matmul(im - at::matmul(u, ut), at::matmul(gu, sigma_mat_inv));
     }
-    u_term = u_term.mm(vt);
+    u_term = at::matmul(u_term, vt);
   } else {
-    u_term = at::zeros({1}, self.type()).expand_as(self);
+    u_term = at::zeros_like(self);
   }
 
   if (gv.defined()) {
-    auto gvt = gv.t();
-    v_term = sigma_mat.mm(F.mul(vt.mm(gv) - gvt.mm(v))).mm(vt);
+    auto gvt = gv.transpose(-2, -1);
+    v_term = at::matmul(sigma_mat, at::matmul(F.mul(at::matmul(vt, gv) - at::matmul(gvt, v)), vt));
     if (n > k) {
-      v_term = v_term + sigma_mat_inv.mm(gvt.mm(in - v.mm(vt)));
+      v_term = v_term + at::matmul(sigma_mat_inv, at::matmul(gvt, in - at::matmul(v, vt)));
     }
-    v_term = u.mm(v_term);
+    v_term = at::matmul(u, v_term);
   } else {
-    v_term = at::zeros({1}, self.type()).expand_as(self);
+    v_term = at::zeros_like(self);
   }
 
   return u_term + sigma_term + v_term;
 }
 
+// http://eprints.maths.ox.ac.uk/1079/1/NA-08-01.pdf
+Tensor symeig_backward(const std::vector<torch::autograd::Variable> &grads, const Tensor& self,
+                    bool eigenvectors, bool upper, const Tensor& lambda, const Tensor& v) {
+  // This gradient is symmetric, and not triangular.
+  // symeig operates only on symmetric inputs, which is a subspace of
+  // R^{n x n}, and hence the derivative is not well-defined for off-diagonal
+  // elements. We resolve this by taking the gradient of the functionally independent
+  // elements of the matrix (i.e., the lower triangular portion of the input) and then
+  // reflect it on the upper triangular portion, thereby symmetrizing the gradient of
+  // the symeig operation. The motivation behind this choice is that symmetric gradient
+  // leads to stable gradient updates, and retains symmetry of the updated matrix if it
+  // were updated by a gradient based algorithm.
+  TORCH_CHECK(eigenvectors,
+           "symeig_backward: Setting eigenvectors to false in torch.symeig doesn't compute eigenvectors ",
+           "and hence we cannot compute backward. Please use torch.symeig(eigenvectors=True)");
+
+  auto glambda = grads[0];
+  auto gv = grads[1];
+
+  auto vt = v.transpose(-2, -1);
+
+  Tensor result;
+  if (gv.defined()) {
+      Tensor F = lambda.unsqueeze(-2) - lambda.unsqueeze(-1);
+      F.diagonal(/*offset=*/0, /*dim1=*/-2, /*dim2=*/-1).fill_(INFINITY);
+      F.pow_(-1);
+      F.mul_(at::matmul(vt, gv));
+      result = at::matmul(v, at::matmul(F, vt));
+  } else {
+      result = at::zeros_like(self);
+  }
+
+  if (glambda.defined()) {
+      result.add_(at::matmul(at::matmul(v, at::diag_embed(glambda, /*offset=*/0, /*dim1=*/-2, /*dim2=*/-1)), vt));
+  }
+  return result.add(result.transpose(-2, -1)).mul_(0.5);
+}
+
+// We refer Walter, S.F and Lehmann, L., Algorithmic Differentiation of Linear
+// Algebra Functions with Application in Optimum Experimental Design (Extended Version)
+// The derivative for the QR decomposition is adapted from Eq. 42 of the
+// above reference.
+Tensor qr_backward(const std::vector<torch::autograd::Variable> &grads, const Tensor& self,
+                   bool some, const Tensor& Q, const Tensor& R) {
+  auto grad_Q = grads[0];
+  auto grad_R = grads[1];
+  TORCH_CHECK(R.size(-2) == R.size(-1),
+              "The derivative when R is non-square is not implemented. ");
+
+  // Compute R (R')^{T}
+  Tensor R_term;
+  if (grad_R.defined()) {
+    R_term = at::matmul(R, grad_R.transpose(-2, -1));
+  } else {
+    // R is ... x N x N, grad_R is ... x N x N and grad_R.T is ... x N x N
+    R_term = at::zeros_like(R);
+  }
+
+  // Compute Q^{T} Q'
+  Tensor Q_term;
+  if (grad_Q.defined()) {
+    Q_term = at::matmul(Q.transpose(-2, -1), grad_Q);
+  } else {
+    // Q is ... x M x N, Q.T is ... x N x M and grad_Q is ... x M x N
+    Q_term = at::zeros_like(R);
+  }
+
+  // We want to compute: (rhs_solve_1 . R^{-T})
+  // Note that (rhs_solve_1 . R^{-T}) = (R^{-1} . rhs_solve_1^{T})^{T}
+  // Since R is upper triangular, we can do this using
+  // triangular_solve(rhs_solve_1^{T}, R)^{T}
+  auto rhs_solve_1 = R_term - R_term.transpose(-2, -1) + Q_term - Q_term.transpose(-2, -1);
+  rhs_solve_1 = at::tril(rhs_solve_1, /*k=*/-1);
+  Tensor solve_soln_1;
+  std::tie(solve_soln_1, std::ignore) = at::triangular_solve(rhs_solve_1.transpose(-2, -1), R,
+                                                             /*upper=*/true, /*transpose=*/false,
+                                                             /*unitriangular=*/false);
+  Tensor grad_A;
+  if (grad_R.defined()) {
+    grad_A = at::matmul(Q, solve_soln_1.transpose(-2, -1) + grad_R);
+  } else {
+    grad_A = at::matmul(Q, solve_soln_1.transpose(-2, -1));
+  }
+
+  // Successive computations involve computation of QQ^{T} which is identity when A is square
+  if (self.size(-1) != self.size(-2)) {
+    Tensor rhs_solve_2;
+    // We use the same trick from above for this computation
+    if (grad_Q.defined()) {
+      rhs_solve_2 = grad_Q - at::matmul(Q, Q_term);
+    } else {
+      rhs_solve_2 = -at::matmul(Q, Q_term);
+    }
+    Tensor solve_soln_2;
+    std::tie(solve_soln_2, std::ignore) = at::triangular_solve(rhs_solve_2.transpose(-2, -1), R,
+                                                               /*upper=*/true, /*transpose=*/false,
+                                                               /*unitriangular=*/false);
+    grad_A.add_(solve_soln_2.transpose(-2, -1));
+  }
+  return grad_A;
+}
+
 // Invertible case is derived from Jacobi's formula, and also can be found at:
 // http://eprints.maths.ox.ac.uk/1079/1/NA-08-01.pdf
 Tensor det_backward(const Tensor & grad, const Tensor& self, const Tensor& det) {
-  auto det_val = det.toCDouble();
-  if (det_val != 0 /* invertible */) {
-    return grad * det * self.inverse().t();
-  } else /* otherwise det = \prod(sigma) = 0, use svd */ {
+  auto singular_case_backward = [&](const Tensor& grad, const Tensor& self, const Tensor& det) -> Tensor {
     Tensor u, sigma, v;
     std::tie(u, sigma, v) = self.svd();
-    auto gsigma = prod_backward(grad, sigma, det);
-    return svd_backward({{}, gsigma, {}}, self, true, u, sigma, v);
+    auto gsigma = prod_backward(grad.unsqueeze(-1), sigma, det.unsqueeze(-1));
+    return svd_backward({{}, gsigma, {}}, self, true, true, u, sigma, v);
+  };
+
+  auto nonsingular_case_backward = [&](const Tensor& grad, const Tensor& self, const Tensor& det) -> Tensor {
+    return unsqueeze_multiple(grad * det, {-1, -2}, self.dim()) * self.inverse().transpose(-2, -1);
+  };
+
+  if (self.dim() == 2) {
+    if (det.item<double>() == 0) {
+      return singular_case_backward(grad, self, det);
+    } else {
+      return nonsingular_case_backward(grad, self, det);
+    }
+  } else {
+    auto nonzero_det_indices = at::where(det);
+
+    if (nonzero_det_indices[0].size(0) == det.numel()) {  // all determinants are nonzero (non-singular)
+      return nonsingular_case_backward(grad, self, det);
+    }
+
+    auto zero_det_indices = at::where(det == 0);
+
+    if (zero_det_indices[0].size(0) == det.numel()) {  // all determinants are zero (singular)
+      return singular_case_backward(grad, self, det);
+    }
+
+    Tensor grad_det = at::empty_like(self);
+
+    // invertible case
+    grad_det.index_put_(/*indices=*/nonzero_det_indices,
+                        /*value=*/nonsingular_case_backward(grad.index(nonzero_det_indices),
+                                                            self.index(nonzero_det_indices),
+                                                            det.index(nonzero_det_indices)));
+
+    // non-invertible case, uses SVD
+    grad_det.index_put_(/*indices=*/zero_det_indices,
+                        /*value=*/singular_case_backward(grad.index(zero_det_indices),
+                                                         self.index(zero_det_indices),
+                                                         det.index(zero_det_indices)));
+
+    return grad_det;
   }
 }
 
 Tensor logdet_backward(const Tensor & grad, const Tensor& self, const Tensor& logdet) {
-  auto logdet_val = logdet.toCDouble();
-  if (logdet_val != -INFINITY /* det != 0, invertible */) {
-    return grad * self.inverse().t();
-  } else /* otherwise det = \prod(sigma) = 0, use svd */ {
+  auto singular_case_backward = [&](const Tensor& grad, const Tensor& self) -> Tensor {
     Tensor u, sigma, v;
     std::tie(u, sigma, v) = self.svd();
-    // backward det = \sum log(sigma)
-    auto gsigma = grad.div(sigma);
-    return svd_backward({{}, gsigma, {}}, self, true, u, sigma, v);
+    // logdet = \sum log(sigma)
+    auto gsigma = grad.unsqueeze(-1).div(sigma);
+    return svd_backward({{}, gsigma, {}}, self, true, true, u, sigma, v);
+  };
+
+  auto nonsingular_case_backward = [&](const Tensor& grad, const Tensor& self) -> Tensor {
+    return unsqueeze_multiple(grad, {-1, -2}, self.dim()) * self.inverse().transpose(-2, -1);
+  };
+
+  if (self.dim() == 2) {
+    if (logdet.item<double>() != -INFINITY) {
+      return nonsingular_case_backward(grad, self);
+    } else {
+      return singular_case_backward(grad, self);
+    }
+  } else {
+    auto finite_logdet_indices = at::where(logdet != -INFINITY);
+
+    if (finite_logdet_indices[0].size(0) == logdet.numel()) {  // all log determinants are finite (non-singular)
+      return nonsingular_case_backward(grad, self);
+    }
+
+    auto neginf_logdet_indices = at::where(logdet == -INFINITY);
+
+    if (neginf_logdet_indices[0].size(0) == logdet.numel()) {  // all log determinants are -inf (singular)
+      return singular_case_backward(grad, self);
+    }
+
+    Tensor grad_logdet = at::empty_like(self);
+
+    // invertible case
+    grad_logdet.index_put_(/*indices=*/finite_logdet_indices,
+                           /*value=*/nonsingular_case_backward(grad.index(finite_logdet_indices),
+                                                               self.index(finite_logdet_indices)));
+
+    // non-invertible case, uses SVD
+    grad_logdet.index_put_(/*indices=*/neginf_logdet_indices,
+                           /*value=*/singular_case_backward(grad.index(neginf_logdet_indices),
+                                                            self.index(neginf_logdet_indices)));
+
+    return grad_logdet;
   }
 }
 
-Tensor slogdet_backward(const std::vector<torch::autograd::Variable> &grads,
+Tensor slogdet_backward(const Tensor& grad_logabsdet,
                         const Tensor& self,
                         const Tensor& signdet, const Tensor& logabsdet) {
-  AT_ASSERTM(!grads[0].defined(), "slogdet's sign output should never have gradient");
-  auto signdet_val = signdet.toCDouble();
-  if (signdet_val != 0 /* det != 0, invertible */) {
-    return grads[1] * self.inverse().t();
-  } else /* otherwise det = \prod(sigma) = 0, use svd */ {
+  auto singular_case_backward = [&](const Tensor& grad_logabsdet, const Tensor& self) -> Tensor {
     Tensor u, sigma, v;
     std::tie(u, sigma, v) = self.svd();
     // sigma has all non-negative entries (also with at least one zero entry)
     // so logabsdet = \sum log(abs(sigma))
     // but det = 0, so backward logabsdet = \sum log(sigma)
-    auto gsigma = grads[1].div(sigma);
-    return svd_backward({{}, gsigma, {}}, self, true, u, sigma, v);
+    auto gsigma = grad_logabsdet.unsqueeze(-1).div(sigma);
+    return svd_backward({{}, gsigma, {}}, self, true, true, u, sigma, v);
+  };
+
+  auto nonsingular_case_backward = [&](const Tensor& grad_logabsdet, const Tensor& self) -> Tensor {
+    return unsqueeze_multiple(grad_logabsdet, {-1, -2}, self.dim()) * self.inverse().transpose(-2, -1);
+  };
+
+  if (self.dim() == 2) {
+    if (signdet.item<double>() == 0) {
+      return singular_case_backward(grad_logabsdet, self);
+    } else {
+      return nonsingular_case_backward(grad_logabsdet, self);
+    }
+  } else {
+    auto nonzero_signdet_indices = at::where(signdet);
+
+    if (nonzero_signdet_indices[0].size(0) == logabsdet.numel()) {  // all log determinants are finite (non-singular)
+      return nonsingular_case_backward(grad_logabsdet, self);
+    }
+
+    auto zero_signdet_indices = at::where(signdet == 0);
+
+    if (zero_signdet_indices[0].size(0) == logabsdet.numel()) {  // all log determinants are -inf (singular)
+      return singular_case_backward(grad_logabsdet, self);
+    }
+
+    Tensor grad_slogdet = at::empty_like(self);
+
+    // invertible case
+    grad_slogdet.index_put_(/*indices=*/nonzero_signdet_indices,
+                            /*value=*/nonsingular_case_backward(grad_logabsdet.index(nonzero_signdet_indices),
+                                                                self.index(nonzero_signdet_indices)));
+
+    // non-invertible case, uses SVD
+    grad_slogdet.index_put_(/*indices=*/zero_signdet_indices,
+                            /*value=*/singular_case_backward(grad_logabsdet.index(zero_signdet_indices),
+                                                             self.index(zero_signdet_indices)));
+
+    return grad_slogdet;
   }
 }
 
 // Reference:
 // https://people.maths.ox.ac.uk/gilesm/files/NA-08-01.pdf
 // Sec. 2.3.1 Matrix inverse product
-std::tuple<Tensor, Tensor> trtrs_backward(
+std::tuple<Tensor, Tensor> triangular_solve_backward(
     const Tensor & grad_x, const Tensor & grad_m,
     const Tensor & b, const Tensor & a, const Tensor & x,
     const bool upper, const bool transpose, const bool unitriangular,
     std::array<bool, 2> output_mask) {
   Tensor grad_b, grad_a;
   if (grad_x.defined()) {
-    grad_b = std::get<0>(grad_x.trtrs(a, upper, !transpose, unitriangular));
+    grad_b = std::get<0>(grad_x.triangular_solve(a, upper, !transpose, unitriangular));
     if (output_mask[1]) {
-      grad_a = transpose ? -x.mm(grad_b.t()) : -grad_b.mm(x.t());
+      grad_a = transpose ? -x.matmul(grad_b.transpose(-1, -2)) : -grad_b.matmul(x.transpose(-1, -2));
       if (upper) {
         grad_a = grad_a.triu((int) unitriangular);
       } else {
@@ -1051,10 +1987,10 @@ std::tuple<Tensor, Tensor> trtrs_backward(
     }
   }
   if (!grad_a.defined()) {
-    grad_a = at::zeros({1}, a.type()).expand_as(a);
+    grad_a = at::zeros({1}, a.options()).expand_as(a);
   }
   if (!grad_b.defined()) {
-    grad_b = at::zeros({1}, b.type()).expand_as(b);
+    grad_b = at::zeros({1}, b.options()).expand_as(b);
   }
   if (output_mask[1] && grad_m.defined()) {
     grad_a = grad_a.add(grad_m);
@@ -1062,12 +1998,33 @@ std::tuple<Tensor, Tensor> trtrs_backward(
   return std::tuple<Tensor, Tensor>{grad_b, grad_a};
 }
 
+std::tuple<Tensor, Tensor> cholesky_solve_backward(
+    const Tensor& grad_x, const Tensor& self,
+    const Tensor& input2, const Tensor& result, const bool upper) {
+  Tensor grad_self, grad_input2;
+  if (grad_x.defined()) {
+    grad_self = grad_x.cholesky_solve(input2, /*upper=*/upper);
+  } else {
+    grad_self = at::zeros({1}, self.options()).expand_as(self);
+  }
+
+  Tensor common_term = at::matmul(grad_self, result.transpose(-2, -1));
+  common_term = common_term + common_term.transpose(-2, -1);
+
+  if (upper) {
+    grad_input2 = -at::matmul(input2, common_term);
+  } else {
+    grad_input2 = -at::matmul(common_term, input2);
+  }
+  return std::tuple<Tensor, Tensor>{grad_self, grad_input2};
+}
+
 // Generally speaking, fft's backward is ifft.
 Tensor fft_backward(const Tensor& self, const Tensor& grad, int64_t signal_ndim,
                     bool complex_input, bool complex_output,
-                    bool inverse, IntList checked_signal_sizes,
+                    bool inverse, IntArrayRef checked_signal_sizes,
                     bool normalized, bool onesided,
-                    IntList output_sizes) {
+                    IntArrayRef output_sizes) {
   Tensor gI;
   if (!complex_input && complex_output) {
     // Forward is R2C
@@ -1094,7 +2051,7 @@ Tensor fft_backward(const Tensor& self, const Tensor& grad, int64_t signal_ndim,
         }
         zero_grad_shape[signal_ndim] = zero_length;
         zero_grad_shape[signal_ndim + 1] = 2;
-        complex_full_grad =  at::cat({ grad, at::zeros(zero_grad_shape, grad.type()) }, signal_ndim);
+        complex_full_grad =  at::cat({ grad, at::zeros(zero_grad_shape, grad.options()) }, signal_ndim);
       }
       gI = _fft_with_size(complex_full_grad, signal_ndim,
                           /* complex_input */ true, /* complex_output */ true,
@@ -1211,7 +2168,7 @@ std::tuple<Tensor, Tensor, Tensor> batchnorm_double_backward(
     bool training,
     double eps,
     const Tensor & save_mean,
-    const Tensor & save_std,
+    const Tensor & save_invstd,
     std::array<bool,3> output_mask) {
 
   bool affine = gamma.defined();
@@ -1227,7 +2184,7 @@ std::tuple<Tensor, Tensor, Tensor> batchnorm_double_backward(
       ggB_expanded = expand_as_dim1(ggB, input);
     }
   } else {
-    gamma_expanded = input.type().tensor({}).fill_(1);
+    gamma_expanded = at::ones({}, input.options());
   }
 
   // define some terms we will reuse
@@ -1235,9 +2192,14 @@ std::tuple<Tensor, Tensor, Tensor> batchnorm_double_backward(
   for (auto s : input.sizes().slice(2)) {
     M *= s;
   }
-  auto mu = unsqueeze_dim1(training ? save_mean : running_mean, input);
+  // for half inputs, save_mean, save_invstd are float (ideally, we would cast
+  // everything else, but not now)
+  auto mu = unsqueeze_dim1(training ? save_mean.to(input.scalar_type()) : running_mean, input);
   auto input_sub_mu = input - mu;
-  auto sigma2_eps_neg_1_2 = unsqueeze_dim1(training ? save_std : running_var.add(Scalar(eps)).pow(-0.5), input);
+  auto sigma2_eps_neg_1_2 = unsqueeze_dim1(
+      training ? save_invstd.to(input.scalar_type())
+               : running_var.add(Scalar(eps)).pow(-0.5),
+      input);
   auto sigma2_eps_neg_1 = sigma2_eps_neg_1_2.pow(2);
   auto sigma2_eps_neg_3_2 = sigma2_eps_neg_1_2.pow(3);
 
@@ -1286,7 +2248,7 @@ std::tuple<Tensor, Tensor, Tensor> batchnorm_double_backward(
   if (affine && ggI.defined()) {
     if (training) {
       // gG is just the first backwards with the gamma term removed (then shaped properly)
-      gG = ggI * first_back_grad_input(gO, sigma2_eps_neg_1_2.type().tensor({}).fill_(1));
+      gG = ggI * first_back_grad_input(gO, at::ones({}, sigma2_eps_neg_1_2.options()));
       gG = sum_exclude_dim1(gG, false);
     } else {
       gG = sum_exclude_dim1(ggI * gO * sigma2_eps_neg_1_2, false);
@@ -1324,8 +2286,8 @@ std::tuple<Tensor, Tensor, Tensor> batchnorm_double_backward(
 }
 
 std::tuple<Tensor, Tensor, Tensor> _trilinear_backward(const Tensor& grad_out, const Tensor& i1, const Tensor& i2, const Tensor& i3,
-						       IntList expand1, IntList expand2, IntList expand3,
-						       IntList sumdim, int64_t unroll_dim, std::array<bool, 3> grad_mask) {
+                                                       IntArrayRef expand1, IntArrayRef expand2, IntArrayRef expand3,
+                                                       IntArrayRef sumdim, int64_t unroll_dim, std::array<bool, 3> grad_mask) {
   Tensor grad_i1, grad_i2, grad_i3;
   if (grad_mask[0])
     grad_i1 = at::_trilinear(grad_out, i2, i3, sumdim, expand2, expand3, expand1);
@@ -1335,6 +2297,53 @@ std::tuple<Tensor, Tensor, Tensor> _trilinear_backward(const Tensor& grad_out, c
     grad_i3 = at::_trilinear(i1, i2, grad_out, expand1, expand2, sumdim, expand3);
   return std::tuple<Tensor, Tensor, Tensor>(grad_i1, grad_i2, grad_i3);
 }
+
+Tensor log1p_backward(const Tensor& grad, const Tensor& self) {
+  if (self.is_sparse()) {
+    AT_ERROR(
+      "log1p of a sparse tensor is made to be non-differentiable since ",
+      "local gradient of zero is 1 / (0 + 1) = 1 and it makes the tensor dense. ",
+      "Use a different mathematical operation which preserves sparsity of gradients, ",
+      "or report a bug if you think this is an error.");
+  }
+  return grad / (self + 1);
+}
+
+Tensor sparse_constructor_values_backward(const Tensor& sparse_grad_out, const Tensor& indices, IntArrayRef values_shape) {
+  // TODO: improve this backward by writing a kernel (maybe)
+  auto dense_grad = sparse_grad_out.is_sparse() ? sparse_grad_out.to_dense() : sparse_grad_out;
+  auto full_size = sparse_grad_out.sizes();
+  auto flattened_grad_shape = values_shape.vec();
+  flattened_grad_shape[0] = at::prod_intlist(full_size.slice(0, indices.size(0)));
+  auto flattened_dense_grad = dense_grad.view(flattened_grad_shape);
+  auto flattened_indices = at::sparse::flatten_indices(indices, full_size);
+  return flattened_dense_grad.index_select(0, flattened_indices);
+}
+
+// Because the backward of pad(input, pads) is just pad(grad_output, [-p for p in pads])
+Tensor constant_pad_nd_backward(const Tensor& grad, IntArrayRef pad) {
+  auto negated_pad = pad.vec();
+  std::transform(negated_pad.cbegin(), negated_pad.cend(), negated_pad.begin(), std::negate<int64_t>());
+  return at::constant_pad_nd(grad, negated_pad, 0);
+}
+
+Tensor embedding_dense_double_backward(const Tensor & grad, const Tensor & indices) {
+  // since first backward takes care of padding_idx
+  // and scaling by frequency, we don't need to worry
+  // about it here.
+  auto gg_weight = grad.index_select(0, indices.reshape(-1));
+
+  // reshape gradient as per the shape of indices
+  auto size = indices.sizes().vec();
+  size.push_back(-1);
+
+  return gg_weight.view(size);
+}
+
+Tensor index_backward(Tensor zeros_like_self, TensorList indices, const Tensor& grad) {
+   return at::_index_put_impl_(zeros_like_self, indices, grad, true, true);
+}
+
 
 } // anonymous namespace
 

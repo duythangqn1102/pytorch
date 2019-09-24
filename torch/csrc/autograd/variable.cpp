@@ -1,18 +1,15 @@
-#include "torch/csrc/autograd/variable.h"
+#include <torch/csrc/autograd/variable.h>
 
-#include "torch/csrc/assertions.h"
-#include "torch/csrc/autograd/edge.h"
-#include "torch/csrc/autograd/engine.h"
-#include "torch/csrc/autograd/function.h"
-#include "torch/csrc/autograd/functions/accumulate_grad.h"
-#include "torch/csrc/autograd/functions/tensor.h"
-#include "torch/csrc/autograd/generated/Functions.h"
-#include "torch/csrc/autograd/generated/VariableType.h"
-#include "torch/csrc/autograd/variable_version.h"
-#include "torch/csrc/jit/tracer_state.h"
-#include "torch/csrc/utils/auto_unique_ptr.h"
+#include <torch/csrc/autograd/autograd.h>
+#include <torch/csrc/autograd/edge.h>
+#include <torch/csrc/autograd/engine.h>
+#include <torch/csrc/autograd/function.h>
+#include <torch/csrc/autograd/functions/accumulate_grad.h>
+#include <torch/csrc/autograd/functions/tensor.h>
+#include <torch/csrc/autograd/generated/Functions.h>
 
 #include <ATen/ATen.h>
+#include <c10/util/Exception.h>
 
 #include <list>
 #include <memory>
@@ -20,184 +17,176 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <typeinfo>
 
-namespace torch { namespace autograd {
-Variable::Impl::Impl(at::Tensor data, bool requires_grad, Edge gradient_edge)
-    : TensorImpl(VariableType::getType(data)),
-      data_(std::move(data)),
-      grad_fn_(std::move(gradient_edge.function)),
-      requires_grad_(false),
-      is_view_(false),
-      output_nr_(gradient_edge.input_nr),
-      pyobj_(nullptr) {
+namespace torch {
+namespace autograd {
+Variable::AutogradMeta::AutogradMeta(at::TensorImpl* self_impl, bool requires_grad, Edge gradient_edge) {
+  grad_fn_ = std::move(gradient_edge.function);
+  requires_grad_ = false;
+  is_view_ = false;
+  output_nr_ = gradient_edge.input_nr;
+
   // set_requires_grad also checks error conditions.
-  set_requires_grad(requires_grad);
-  TORCH_ASSERTM(
+  set_requires_grad(requires_grad, self_impl);
+  TORCH_CHECK(
       !grad_fn_ || !requires_grad_,
       "requires_grad should be false if grad_fn is set");
-  if (!data_.defined()) {
-    throw std::runtime_error("data is undefined");
-  }
 }
 
-Variable::Impl::~Impl() = default;
-
-const char* Variable::Impl::toString() const {
-  // technically this will say Variable[CPUFloatType] rather than
-  // Variable[CPUFloatTensor], but this is better than just Variable
-  return type().toString();
-}
-
-IntList Variable::Impl::sizes() const {
-  return data_.sizes();
-}
-
-IntList Variable::Impl::strides() const {
-  return data_.strides();
-}
-
-int64_t Variable::Impl::dim() const {
-  return data_.dim();
-}
-
-const char* Variable::Impl::typeString() {
-  return "VariableType";
-}
-
-void* Variable::Impl::unsafeGetTH(bool retain) {
-  return data_.unsafeGetTH(retain);
-}
-
-std::unique_ptr<at::Storage> Variable::Impl::storage() {
-  return data_.storage();
-}
-
-Scalar Variable::Impl::localScalar() {
-  return data_.pImpl->localScalar();
-}
-
-std::shared_ptr<Function> Variable::Impl::get_grad_accumulator() {
-  if (grad_fn_) {
+std::shared_ptr<Node> Variable::grad_accumulator() const {
+  auto autograd_meta = get_autograd_meta();
+  if (autograd_meta->grad_fn_) {
     throw std::logic_error(
-        "get_grad_accumulator() should be only called on leaf Variables");
+        "grad_accumulator() should be only called on leaf Variables");
   }
-  if (!requires_grad_) {
+  if (!autograd_meta->requires_grad_) {
     return nullptr;
   }
 
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard<std::mutex> lock(autograd_meta->mutex_);
 
-  auto result = grad_accumulator_.lock();
+  auto result = autograd_meta->grad_accumulator_.lock();
   if (result)
     return result;
 
-  result = std::make_shared<AccumulateGrad>(Variable(this, true));
-  grad_accumulator_ = result;
+  c10::raw::intrusive_ptr::incref(unsafeGetTensorImpl());
+  auto intrusive_from_this = c10::intrusive_ptr<at::TensorImpl>::reclaim(unsafeGetTensorImpl());
+  result = std::make_shared<AccumulateGrad>(Variable(std::move(intrusive_from_this)));
+  autograd_meta->grad_accumulator_ = result;
   return result;
 }
 
-Tensor Variable::Impl::detach() const {
-  auto detached = make_variable(data_, /*requires_grad=*/false);
-  detached.set_version_counter(version_counter_);
-  return detached;
-}
-
-void Variable::Impl::detach_() {
-  if (is_view_) {
-    throw std::runtime_error(
-        "Can't detach views in-place. Use detach() instead");
+void Variable::detach_() {
+  if (is_view()) {
+    AT_ERROR("Can't detach views in-place. Use detach() instead");
   }
-  set_requires_grad(false);
-  grad_fn_.reset();
-  output_nr_ = 0;
+  auto autograd_meta = get_autograd_meta();
+  autograd_meta->set_requires_grad(false, unsafeGetTensorImpl());
+  autograd_meta->grad_fn_.reset();
+  autograd_meta->output_nr_ = 0;
 }
 
-void Variable::Impl::backward(
-    at::optional<Tensor> gradient,
+void Variable::backward(
+    const Tensor& gradient,
     bool keep_graph,
-    bool create_graph) {
-  std::vector<Edge> edges;
-  edges.emplace_back(grad_fn_, output_nr_);
-
-  std::vector<Variable> inputs;
-  if (!gradient.has_value()) {
-    gradient = make_variable(at::ones_like(data_), /*requires_grad=*/false);
-  }
-  inputs.push_back(std::move(as_variable_ref(*gradient)));
-  Engine::get_default_engine().execute(edges, inputs, keep_graph, create_graph);
+    bool create_graph) const {
+  torch::autograd::backward({*this}, {gradient}, keep_graph, create_graph);
 }
 
-void Variable::Impl::set_data(Tensor new_data) {
-  if (new_data.type() != data_.type()) {
-    type_ = VariableType::getType(new_data.type());
-    // Clear grad_accumulator if it exists, since it stores the old type info.
-    grad_accumulator_.reset();
+void Variable::set_data(const at::Tensor &new_data) const {
+  // `var.set_data(new_data)` shallow-copies all non-autograd TensorImpl fields
+  // from `new_data` to `var`. It requires that `new_data` and `var` have compatible
+  // tensor type.
+  TORCH_CHECK(
+    _has_compatible_shallow_copy_type(*this, new_data),
+    "Attempted to call `variable.set_data(tensor)`, but `variable` and `tensor` have incompatible tensor type.");
+
+  // Resets gradient accumulator if metadata is out of date
+  Variable::AutogradMeta* autograd_meta = get_autograd_meta();
+  std::lock_guard<std::mutex> lock(autograd_meta->mutex_);
+  auto prior_accumulator = autograd_meta->grad_accumulator_.lock();
+  if (prior_accumulator) {
+    const auto prior_device = prior_accumulator->input_metadata(0).device();
+    const auto new_device = new_data.device();
+
+    if (new_data.type() != type() || prior_device != new_device) {
+      autograd_meta->grad_accumulator_.reset();
+    }
   }
-  data_ = std::move(new_data);
+
+  // Version counter is not shared when we replace a `Variable`'s tensor data
+  // by calling `set_data(...)`. The original version of the `Variable` is always preserved.
+  // See NOTE [ Version Counter Sharing ] for details.
+  //
+  // `var.set_data(new_data)` always ignores `var`'s `allow_tensor_metadata_change_`, because
+  // users need this API as an escape hatch for changing a tensor's metadata regardless of its
+  // `allow_tensor_metadata_change_` value, and the users are responsible for ensuring this is
+  // the behavior they want.
+  get()->shallow_copy_from(new_data.getIntrusivePtr());
 }
 
-Variable::ViewImpl::ViewImpl(Variable base, at::Tensor data, Edge gradient_edge)
-    : Variable::Impl(std::move(data), false, std::move(gradient_edge)),
-      base_(std::move(base)) {
-  TORCH_ASSERTM(base_.defined(), "base is undefined");
+Variable::DifferentiableViewMeta::DifferentiableViewMeta(at::TensorImpl* self_impl, Variable base, Edge gradient_edge)
+    : Variable::AutogradMeta(self_impl, false, std::move(gradient_edge)) {
+  base_ = std::move(base);
+  TORCH_CHECK(base_.defined(), "base is undefined");
   if (base_.is_view()) {
     base_ = base_.base();
   }
   is_view_ = true;
-  version_counter_ = base_.version_counter();
-  attr_version = version_counter_.current_version();
+  self_impl->set_version_counter(base_.version_counter());
+  attr_version = self_impl->version_counter().current_version();
 }
 
-std::shared_ptr<Function>& Variable::ViewImpl::get_grad_fn() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (!grad_fn_ && !base_.requires_grad()) {
-    return grad_fn_;
-  }
-  auto current_version = version_counter_.current_version();
-  if (attr_version != current_version) {
-    TORCH_ASSERT(output_nr_ == 0);
-    auto fn = std::make_shared<generated::AsStridedBackward>();
-    fn->self_geometry = at::TensorGeometry(base_);
-    fn->size = sizes();
-    fn->stride = strides();
-    fn->storage_offset = data_.storage_offset();
-    fn->set_next_edges(collect_next_edges(base_));
-    fn->add_input_metadata(base_.type(), sizes());
-    grad_fn_ = std::move(fn);
-    attr_version = current_version;
-  }
-  return grad_fn_;
+Variable::DifferentiableViewMeta::~DifferentiableViewMeta() {
+  base_.reset();
 }
 
-void Variable::ViewImpl::rebase_history(Edge gradient_edge) {
-  TORCH_ASSERT(gradient_edge.input_nr == 0);
-  TORCH_ASSERT(gradient_edge.function);
-  TORCH_ASSERTM(
-      gradient_edge.function->num_inputs() == 1,
-      "Functions which modify views in-place must return a single Variable");
-  this->output_nr_ = gradient_edge.input_nr;
-  auto copy_slices = std::make_shared<CopySlices>(
-      base_, at::TensorGeometry(data_), std::move(gradient_edge.function));
-  base_.set_gradient_edge({std::move(copy_slices), 0});
-  get_grad_fn(); // trigger an update to the view's grad_fn
+const std::shared_ptr<Node>& Variable::grad_fn() const {
+  if (is_view()) {
+    auto diff_view_meta = static_cast<Variable::DifferentiableViewMeta*>(get_autograd_meta());
+    std::lock_guard<std::mutex> lock(diff_view_meta->mutex_);
+    if (!diff_view_meta->grad_fn_ && !diff_view_meta->base_.requires_grad()) {
+      return diff_view_meta->grad_fn_;
+    }
+    auto current_version = this->current_version();
+    if (diff_view_meta->attr_version != current_version) {
+      AT_ASSERT(diff_view_meta->output_nr_ == 0);
+      auto fn = std::make_shared<generated::AsStridedBackward>();
+      fn->self_geometry = at::TensorGeometry(diff_view_meta->base_);
+      fn->size = sizes().vec();
+      fn->stride = strides().vec();
+      fn->storage_offset = storage_offset();
+      fn->set_next_edges(collect_next_edges(diff_view_meta->base_));
+      fn->add_input_metadata(
+        diff_view_meta->base_.type()
+      , sizes() // Note: sizes(), not base_.sizes(), is intentional
+      , diff_view_meta->base_.device());
+      diff_view_meta->grad_fn_ = std::move(fn);
+      diff_view_meta->attr_version = current_version;
+    }
+    return diff_view_meta->grad_fn_;
+  } else {
+    return get_autograd_meta()->grad_fn_;
+  }
 }
 
 void Variable::rebase_history(Edge gradient_edge) {
-  TORCH_ASSERT(gradient_edge.function != nullptr);
+  AT_ASSERT(gradient_edge.function != nullptr);
   if (is_view()) {
-    auto& impl = static_cast<Variable::ViewImpl&>(*get());
-    impl.rebase_history(std::move(gradient_edge));
+    auto diff_view_meta = static_cast<Variable::DifferentiableViewMeta*>(get_autograd_meta());
+    AT_ASSERT(gradient_edge.input_nr == 0);
+    AT_ASSERT(gradient_edge.function);
+    TORCH_CHECK(
+        gradient_edge.function->num_inputs() == 1,
+        "Functions which modify views in-place must return a single Variable");
+    diff_view_meta->output_nr_ = gradient_edge.input_nr;
+    auto copy_slices = std::make_shared<CopySlices>(
+        diff_view_meta->base_, at::TensorGeometry(*this), std::move(gradient_edge.function));
+    diff_view_meta->base_.set_gradient_edge({std::move(copy_slices), 0});
+    grad_fn(); // trigger an update to the view's grad_fn
   } else {
     set_gradient_edge(std::move(gradient_edge));
   }
 }
 
-void Variable::set_tracing_state(
-    jit::tracer::ValueTracingState* new_tracing_state) {
-  get()->tracing_state_.reset(new_tracing_state);
+void Variable::create_cpp_hook() {
+  auto &list = get_autograd_meta()->cpp_hooks_list;
+  list.reset(new hooks_list());
+  std::unique_ptr<FunctionPreHook> hook_ptr(new CppFunctionPreHook(list, output_nr()));
+  clear_hooks();
+  add_hook(std::make_shared<CppFunctionPreHook>(list, 0));
+  auto fn = grad_fn();
+  if (fn) {
+    fn->add_pre_hook(std::move(hook_ptr));
+  }
 }
 
-jit::tracer::ValueTracingState& Variable::tracing_state() const noexcept {
-  return *get()->tracing_state_;
+void Variable::remove_hook(unsigned pos) {
+  auto &list = get_autograd_meta()->cpp_hooks_list;
+  TORCH_CHECK(list && pos < list->size() , "Invalid index, no hook at position ", pos);
+  // Hook will be ignored
+  (*list)[pos] = nullptr;
 }
+
 }} // namespace torch::autograd
